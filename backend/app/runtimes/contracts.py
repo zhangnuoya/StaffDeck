@@ -15,6 +15,16 @@ class AgentRuntimeKind(StrEnum):
     CLAUDE_CODE = "claude_code"
 
 
+def parse_runtime_kind(value: str | None) -> AgentRuntimeKind:
+    """Best-effort parse; unknown/empty values fall back to the native engine."""
+    if not value:
+        return AgentRuntimeKind.NATIVE
+    try:
+        return AgentRuntimeKind(value)
+    except ValueError:
+        return AgentRuntimeKind.NATIVE
+
+
 class RuntimeUnavailableError(Exception):
     """Raised when a runtime kind has no adapter registered yet."""
 

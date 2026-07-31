@@ -180,6 +180,8 @@ export type AgentProfileRead = {
   persona_prompt?: string;
   is_overall: boolean;
   status: 'active' | 'archived' | string;
+  runtime: string;
+  runtime_config: Record<string, unknown>;
   metadata: Record<string, unknown>;
   resources: AgentResourceBindingRead[];
   created_at: string;

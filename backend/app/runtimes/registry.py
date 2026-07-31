@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from sqlmodel import Session
 
+from app.db.models import AgentProfile, ChatSession
 from app.runtimes.adapters.native import NativeAgentRuntime
-from app.runtimes.contracts import AgentRuntime, AgentRuntimeKind, RuntimeUnavailableError
+from app.runtimes.contracts import (
+    AgentRuntime,
+    AgentRuntimeKind,
+    RuntimeUnavailableError,
+    parse_runtime_kind,
+)
 from app.session.session_schema import ChatTurnRequest
 
 
@@ -26,9 +32,18 @@ def resolve_runtime_kind(
 ) -> AgentRuntimeKind:
     """Resolve which runtime should execute the turn.
 
-    Everything falls back to the native engine until per-agent selection is
-    wired to AgentProfile.runtime.
+    The turn's agent wins (explicit request binding), then the session-bound
+    agent; anything missing, mismatched, or unknown falls back to native.
     """
+    resolved_agent_id = agent_id
+    if not resolved_agent_id and session_id:
+        chat_session = db.get(ChatSession, session_id)
+        if chat_session and chat_session.tenant_id == tenant_id:
+            resolved_agent_id = chat_session.agent_id
+    if resolved_agent_id:
+        agent = db.get(AgentProfile, resolved_agent_id)
+        if agent and agent.tenant_id == tenant_id:
+            return parse_runtime_kind(agent.runtime)
     return AgentRuntimeKind.NATIVE
 
 

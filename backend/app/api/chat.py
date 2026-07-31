@@ -44,7 +44,7 @@ from app.observability.spans import (
     reset_span_sink,
     set_span_sink,
 )
-from app.runtimes import resolve_runtime_for_request
+from app.runtimes import RuntimeUnavailableError, resolve_runtime_for_request
 from app.runtimes.adapters.native import NativeAgentRuntime
 from app.security.auth import get_current_user
 from app.security.permissions import agent_owned_by_user, is_admin_user
@@ -926,7 +926,10 @@ def chat_turn(
             response, _draft = scheduled_response
             _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
             return response
-    response = resolve_runtime_for_request(db, request).handle_turn(request)
+    try:
+        response = resolve_runtime_for_request(db, request).handle_turn(request)
+    except RuntimeUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=f"AGENT_RUNTIME_UNAVAILABLE:{exc.kind}") from exc
     _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
     if request.interaction_mode == "scheduled_task" and request.agent_id:
         draft = detect_scheduled_task_draft(
@@ -959,6 +962,13 @@ def chat_stream(
         _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
     if not request.message.strip() and not request.attachments:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+    try:
+        # Preflight: fail fast with 409 before the SSE worker starts when the
+        # agent's runtime has no adapter yet. The worker re-resolves with its
+        # own thread-bound db session.
+        resolve_runtime_for_request(db, request)
+    except RuntimeUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=f"AGENT_RUNTIME_UNAVAILABLE:{exc.kind}") from exc
 
     relay_ready = threading.Event()
     worker_done = threading.Event()

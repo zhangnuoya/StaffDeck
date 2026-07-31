@@ -20,6 +20,7 @@ import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
 import { api, TENANT_ID } from '../api/client';
 import type { EnterpriseAuthUser } from '../auth';
 import { employeeDisplayName, employeeProfile } from '../employee';
+import { AgentRuntime, parseAgentRuntime } from '../enums/agent-runtime';
 import type { AgentProfileRead } from '../types';
 import EmployeeAvatar from './EmployeeAvatar';
 
@@ -34,6 +35,8 @@ type EmployeeProfileFormValues = {
   expertiseTags: string[];
   workModes: string[];
   status: 'active' | 'archived';
+  runtime: AgentRuntime;
+  codexModel: string;
   publishedToGallery: boolean;
 };
 
@@ -52,6 +55,8 @@ const BLANK_FORM: EmployeeProfileFormValues = {
   expertiseTags: [],
   workModes: [],
   status: 'active',
+  runtime: AgentRuntime.Native,
+  codexModel: '',
   publishedToGallery: false,
 };
 
@@ -87,6 +92,8 @@ export default function EmployeeProfileEditor({
       expertiseTags: profile.expertiseTags,
       workModes: profile.workModes,
       status: agent.status === 'archived' ? 'archived' : 'active',
+      runtime: parseAgentRuntime(agent.runtime),
+      codexModel: typeof agent.runtime_config?.model === 'string' ? agent.runtime_config.model : '',
       publishedToGallery: agent.metadata?.published_to_gallery === true,
     });
   }, [agent, open, profile]);
@@ -126,6 +133,11 @@ export default function EmployeeProfileEditor({
         description: form.description.trim(),
         persona_prompt: form.personaPrompt.trim(),
         status: form.status,
+        runtime: form.runtime,
+        runtime_config:
+          form.runtime === AgentRuntime.Codex && form.codexModel.trim()
+            ? { model: form.codexModel.trim() }
+            : {},
         metadata,
       });
       notify.success('数字员工档案已更新');
@@ -185,6 +197,43 @@ export default function EmployeeProfileEditor({
                 </LabeledField>
               </div>
 
+              <div className="employee-profile-form-grid">
+                <LabeledField label="运行引擎">
+                  <Select
+                    value={form.runtime}
+                    disabled={agent?.is_overall === true}
+                    onValueChange={(value) =>
+                      update({
+                        runtime: parseAgentRuntime(value),
+                        ...(value === AgentRuntime.Codex ? { publishedToGallery: false } : {}),
+                      })
+                    }
+                  >
+                    <SelectTrigger className={`${SELECT_TRIGGER_CLASS} w-full`}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={AgentRuntime.Native}>原生引擎</SelectItem>
+                      <SelectItem value={AgentRuntime.Codex}>Codex</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </LabeledField>
+                {form.runtime === AgentRuntime.Codex && (
+                  <LabeledField label="Codex 模型">
+                    <Input
+                      value={form.codexModel}
+                      placeholder="例如：gpt-5-codex（留空用 CLI 默认）"
+                      onChange={(event) => update({ codexModel: event.target.value })}
+                    />
+                  </LabeledField>
+                )}
+              </div>
+              {form.runtime === AgentRuntime.Codex && (
+                <p className="m-0 text-[12px] leading-relaxed text-muted-foreground">
+                  场景技能仅原生引擎可用；Codex 运行时由本机 Codex CLI 执行，具备编码与长任务能力。该员工不能发布到广场。
+                </p>
+              )}
+
               <LabeledField label="岗位描述">
                 <Textarea rows={3} value={form.description} placeholder="概括这个数字员工的岗位边界、服务风格和执行重点" onChange={(event) => update({ description: event.target.value })} />
               </LabeledField>
@@ -214,7 +263,11 @@ export default function EmployeeProfileEditor({
                     开启后，其他账号可以在对话端和数字员工广场中选择这个员工。
                   </p>
                 </div>
-                <Switch checked={form.publishedToGallery} onCheckedChange={(next) => update({ publishedToGallery: next })} />
+                <Switch
+                  checked={form.publishedToGallery}
+                  disabled={form.runtime !== AgentRuntime.Native}
+                  onCheckedChange={(next) => update({ publishedToGallery: next })}
+                />
               </div>
             </div>
           </div>

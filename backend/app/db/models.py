@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import Column, Index, Integer, JSON, UniqueConstraint
+from sqlalchemy import Column, Index, Integer, JSON, String, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -391,6 +391,11 @@ class AgentProfile(SQLModel, table=True):
     persona_prompt: Optional[str] = None
     is_overall: bool = Field(default=False, index=True)
     status: str = Field(default="active", index=True)
+    runtime: str = Field(
+        default="native",
+        sa_column=Column(String, nullable=False, server_default="native", index=True),
+    )
+    runtime_config_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

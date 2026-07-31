@@ -111,6 +111,15 @@ def _migrate_sqlite_skill_schema() -> None:
                 conn.execute(text("ALTER TABLE users ADD COLUMN source VARCHAR NOT NULL DEFAULT 'web'"))
             _migrate_user_source_backfill(conn)
 
+        if "agent_profiles" in tables:
+            agent_columns = {column["name"] for column in inspector.get_columns("agent_profiles")}
+            if "runtime" not in agent_columns:
+                conn.execute(
+                    text("ALTER TABLE agent_profiles ADD COLUMN runtime VARCHAR NOT NULL DEFAULT 'native'")
+                )
+            if "runtime_config_json" not in agent_columns:
+                conn.execute(text("ALTER TABLE agent_profiles ADD COLUMN runtime_config_json JSON"))
+
         if "sessions" in tables:
             session_columns = {column["name"] for column in inspector.get_columns("sessions")}
             if "agent_id" not in session_columns:

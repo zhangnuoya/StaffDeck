@@ -60,6 +60,7 @@ from app.db.models import (
     utc_now,
     User,
 )
+from app.runtimes.contracts import AgentRuntimeKind, parse_runtime_kind
 from app.security.auth import get_current_user
 from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
 from app.security.permissions import is_admin_user as _is_admin_user
@@ -130,6 +131,9 @@ def create_agent(
     ).first()
     if existing:
         raise HTTPException(status_code=409, detail="Agent name already exists")
+    if request.is_overall and request.runtime != AgentRuntimeKind.NATIVE:
+        raise HTTPException(status_code=409, detail="Overall agent must use the native runtime")
+    _ensure_runtime_gallery_compatible(request.runtime, request.metadata or {})
     row = AgentProfile(
         tenant_id=request.tenant_id,
         name=name,
@@ -137,6 +141,8 @@ def create_agent(
         persona_prompt=request.persona_prompt,
         is_overall=request.is_overall,
         status="active",
+        runtime=request.runtime.value,
+        runtime_config_json=dict(request.runtime_config or {}),
         metadata_json=_metadata_with_creator(request.metadata or {}, user),
     )
     db.add(row)
@@ -245,6 +251,11 @@ def update_agent(
     row = _get_agent(db, request.tenant_id, agent_id)
     user = current_user
     _ensure_can_manage_agent(row, user)
+    next_runtime = request.runtime if request.runtime is not None else parse_runtime_kind(row.runtime)
+    next_metadata = request.metadata if request.metadata is not None else (row.metadata_json or {})
+    if row.is_overall and next_runtime != AgentRuntimeKind.NATIVE:
+        raise HTTPException(status_code=409, detail="Overall agent must use the native runtime")
+    _ensure_runtime_gallery_compatible(next_runtime, next_metadata)
     if request.name is not None:
         name = request.name.strip()
         if not name:
@@ -265,6 +276,10 @@ def update_agent(
         row.persona_prompt = request.persona_prompt
     if request.status is not None:
         row.status = request.status
+    if request.runtime is not None:
+        row.runtime = request.runtime.value
+    if request.runtime_config is not None:
+        row.runtime_config_json = dict(request.runtime_config)
     if request.metadata is not None:
         row.metadata_json = _metadata_preserving_creator(
             row.metadata_json or {}, request.metadata, user
@@ -816,11 +831,21 @@ def agent_read(
         persona_prompt=row.persona_prompt,
         is_overall=row.is_overall,
         status=row.status,
+        runtime=row.runtime or "native",
+        runtime_config=dict(row.runtime_config_json or {}),
         metadata=metadata,
         resources=[binding_read(binding) for binding in bindings],
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
+
+
+def _ensure_runtime_gallery_compatible(runtime: AgentRuntimeKind, metadata: dict) -> None:
+    if runtime != AgentRuntimeKind.NATIVE and (metadata or {}).get("published_to_gallery") is True:
+        raise HTTPException(
+            status_code=409,
+            detail="Gallery-published agents must use the native runtime",
+        )
 
 
 def _is_database_locked_error(exc: OperationalError) -> bool:

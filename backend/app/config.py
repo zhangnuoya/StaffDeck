@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     general_skill_pip_index_url: str = ""
     general_skill_pip_timeout_seconds: int = 180
     general_skill_network_install: bool = False
+    # 外部 agent 运行时（Codex 等）：首期要求用户本机已安装对应 CLI。
+    codex_cli_path: str = ""
+    codex_default_model: str = ""
+    codex_timeout_seconds: float = 900.0
+    codex_workspace_root: str = ""
     channel_secret: str = ""
     staffdeck_role: str = "all"
     wechat_ilink_base_url: str = "https://ilinkai.weixin.qq.com"

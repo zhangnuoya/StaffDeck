@@ -2064,5 +2064,10 @@
   "六": "Sat",
   "…等": "…and ",
   "还有": "+ ",
-  "成员": "Member"
+  "成员": "Member",
+  "运行引擎": "Runtime Engine",
+  "原生引擎": "Native Engine",
+  "Codex 模型": "Codex Model",
+  "例如：gpt-5-codex（留空用 CLI 默认）": "e.g. gpt-5-codex (leave empty to use the CLI default)",
+  "场景技能仅原生引擎可用；Codex 运行时由本机 Codex CLI 执行，具备编码与长任务能力。该员工不能发布到广场。": "Scene skills are only available on the native engine. The Codex runtime runs on your local Codex CLI with coding and long-task capabilities. This agent cannot be published to the marketplace."
 }

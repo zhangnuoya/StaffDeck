@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 import pytest
-from sqlmodel import Session, create_engine
+from sqlmodel import Session, SQLModel, create_engine
 from sqlmodel.pool import StaticPool
 
 from app.runtimes import (
@@ -23,6 +23,7 @@ def _make_db() -> Session:
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+    SQLModel.metadata.create_all(engine)
     return Session(engine)
 
 
