@@ -594,7 +594,7 @@ def test_handoff_resume_worker_continues_original_session_once(monkeypatch):
             handled_requests.append(request)
 
     monkeypatch.setattr(chat_api, "engine", engine)
-    monkeypatch.setattr(chat_api, "AgentLoop", FakeAgentLoop)
+    monkeypatch.setattr("app.core.agent_loop.AgentLoop", FakeAgentLoop)
     with Session(engine) as db:
         _admin, user, _other = _seed_handoff_users(db)
         db.add(
@@ -657,7 +657,7 @@ def test_handoff_resume_worker_persists_failed_resume(monkeypatch):
             raise RuntimeError(f"resume failed for {request.session_id}")
 
     monkeypatch.setattr(chat_api, "engine", engine)
-    monkeypatch.setattr(chat_api, "AgentLoop", FailingAgentLoop)
+    monkeypatch.setattr("app.core.agent_loop.AgentLoop", FailingAgentLoop)
     with Session(engine) as db:
         _admin, user, _other = _seed_handoff_users(db)
         db.add(

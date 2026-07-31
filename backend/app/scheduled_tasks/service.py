@@ -15,7 +15,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.agents.branching import model_for_agent
-from app.core import AgentLoop
 from app.db import engine
 from app.db.models import (
     AgentEvent,
@@ -29,6 +28,7 @@ from app.db.models import (
 )
 from app.llm import LLMClient, LLMError
 from app.observability.spans import llm_operation
+from app.runtimes import resolve_runtime_for_request
 from app.scheduled_tasks.schema import (
     ScheduledTaskCreateRequest,
     ScheduledTaskDraftRead,
@@ -441,7 +441,8 @@ def _execute_prepared_scheduled_task(
             client_timezone=task.timezone,
         )
         result: ChatTurnResponse | None = None
-        for seq, item in enumerate(AgentLoop(db).handle_turn_stream(request), start=1):
+        runtime = resolve_runtime_for_request(db, request)
+        for seq, item in enumerate(runtime.handle_turn_stream(request), start=1):
             _record_scheduled_task_stream_event(db, run, run.session_id, seq, item)
             if item.get("event") in {"complete", "done"} and isinstance(item.get("data"), dict):
                 result = ChatTurnResponse.model_validate(item["data"])

@@ -17,7 +17,6 @@ from sqlmodel import Session, select
 
 from app.agents.branching import model_for_agent
 from app.channels.service_outbox import stage_channel_delivery
-from app.core import AgentLoop
 from app.core.cancellation import cancel_chat_turn
 from app.db import engine, get_session
 from app.db.models import (
@@ -45,6 +44,8 @@ from app.observability.spans import (
     reset_span_sink,
     set_span_sink,
 )
+from app.runtimes import resolve_runtime_for_request
+from app.runtimes.adapters.native import NativeAgentRuntime
 from app.security.auth import get_current_user
 from app.security.permissions import agent_owned_by_user, is_admin_user
 from app.security.tenant import ensure_tenant
@@ -552,7 +553,7 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
                 channel="human_handoff_resume",
                 debug=False,
             )
-            AgentLoop(db).handle_turn(request)
+            resolve_runtime_for_request(db, request).handle_turn(request)
             metadata = dict(handoff.metadata_json or {})
             metadata["resume_finished_at"] = utc_now().isoformat()
             handoff.metadata_json = metadata
@@ -925,7 +926,7 @@ def chat_turn(
             response, _draft = scheduled_response
             _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
             return response
-    response = AgentLoop(db).handle_turn(request)
+    response = resolve_runtime_for_request(db, request).handle_turn(request)
     _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
     if request.interaction_mode == "scheduled_task" and request.agent_id:
         draft = detect_scheduled_task_draft(
@@ -1087,7 +1088,7 @@ def chat_stream(
                             request.agent_id,
                         )
                         return
-                for item in AgentLoop(worker_db).handle_turn_stream(request):
+                for item in resolve_runtime_for_request(worker_db, request).handle_turn_stream(request):
                     event_name = str(item["event"])
                     data = item["data"] if isinstance(item.get("data"), dict) else {}
                     item_session_id = str(data.get("sessionId") or request.session_id or source_session_id["value"] or "")
@@ -2224,7 +2225,7 @@ def _cleanup_stale_completed_sessions(
     )
     if not skills:
         return
-    loop = AgentLoop(db)
+    runtime = NativeAgentRuntime(db)
     changed = False
     for row in candidates:
         before = (
@@ -2232,7 +2233,7 @@ def _cleanup_stale_completed_sessions(
             row.active_step_id,
             json.dumps(row.slots_json or {}, sort_keys=True, ensure_ascii=False),
         )
-        loop._finish_stale_completed_skill(tenant_id, row, skills)
+        runtime.finish_stale_completed_skill(tenant_id, row, skills)
         after = (
             row.active_skill_id,
             row.active_step_id,

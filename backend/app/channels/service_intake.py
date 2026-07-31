@@ -926,7 +926,7 @@ def process_inbound(
             chat_session = db.get(ChatSession, session_id)
             if not event or not chat_session:
                 return False
-            from app.core.agent_loop import AgentLoop
+            from app.runtimes import resolve_runtime_for_request
 
             request = ChatTurnRequest(
                 tenant_id=binding.tenant_id,
@@ -939,7 +939,7 @@ def process_inbound(
             )
             _send_wechat_typing(binding, inbound.from_user_id, inbound.context_token, 1, db_engine=use_engine)
             try:
-                AgentLoop(db).handle_turn(request)
+                resolve_runtime_for_request(db, request).handle_turn(request)
             except Exception as exc:
                 logger.exception("渠道入站处理失败 binding=%s event=%s", binding.id, inbound.event_id)
                 db.rollback()
