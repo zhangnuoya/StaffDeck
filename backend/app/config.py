@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     codex_default_model: str = ""
     codex_timeout_seconds: float = 900.0
     codex_workspace_root: str = ""
+    claude_code_cli_path: str = ""
+    claude_code_default_model: str = ""
+    claude_code_timeout_seconds: float = 900.0
     channel_secret: str = ""
     staffdeck_role: str = "all"
     wechat_ilink_base_url: str = "https://ilinkai.weixin.qq.com"

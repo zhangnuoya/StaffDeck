@@ -27,6 +27,12 @@ def create_runtime(db: Session, kind: AgentRuntimeKind) -> AgentRuntime:
         if not codex_cli_available():
             raise RuntimeUnavailableError(kind, "codex CLI 未安装或未配置 codex_cli_path")
         return CodexAgentRuntime(db)
+    if kind == AgentRuntimeKind.CLAUDE_CODE:
+        from app.runtimes.adapters.claude_code import ClaudeCodeAgentRuntime, claude_cli_available
+
+        if not claude_cli_available():
+            raise RuntimeUnavailableError(kind, "claude CLI 未安装或未配置 claude_code_cli_path")
+        return ClaudeCodeAgentRuntime(db)
     raise RuntimeUnavailableError(kind)
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -33,9 +34,11 @@ logger = logging.getLogger(__name__)
 
 _HEARTBEAT_SECONDS = 15.0
 _HISTORY_MESSAGE_LIMIT = 10
-_CODEX_PROGRESS_PHASE = "codex_progress"
+_CLAUDE_PROGRESS_PHASE = "claude_progress"
 
-_CODEX_CLI_NOT_FOUND = "未找到 Codex CLI。请先安装 codex-cli 或在设置中配置 codex_cli_path。"
+_CLAUDE_CLI_NOT_FOUND = (
+    "未找到 Claude Code CLI。请先安装 claude 或在设置中配置 claude_code_cli_path。"
+)
 
 
 @dataclass
@@ -48,24 +51,23 @@ class _PreparedTurn:
     runtime_state: dict[str, Any]
     workspace: Path
     prompt: str
+    system_prompt: str
     is_resume: bool
     reply: str = ""
     usage: dict[str, Any] | None = None
-    failed: bool = False
     response: ChatTurnResponse | None = None
 
 
-class CodexAgentRuntime:
-    """Agent runtime executing turns through the local Codex CLI (`codex exec`).
+class ClaudeCodeAgentRuntime:
+    """Agent runtime executing turns through the local Claude Code CLI.
 
-    Turn lifecycle mirrors AgentLoop so every consumer (SSE relay, channels,
-    scheduled tasks, traces) works unchanged: sessions/messages live in the
-    StaffDeck database, Codex's own thread id is kept in
-    `sessions.runtime_state_json` for resume, and JSONL events are normalized
-    into the existing stream event vocabulary.
+    Mirrors CodexAgentRuntime's turn lifecycle: StaffDeck sessions/messages
+    stay the source of truth, Claude's session_id is persisted in
+    `sessions.runtime_state_json` for --resume, and stream-json events are
+    normalized onto the existing stream event vocabulary.
     """
 
-    runtime_kind = AgentRuntimeKind.CODEX
+    runtime_kind = AgentRuntimeKind.CLAUDE_CODE
 
     def __init__(self, db: Session) -> None:
         self._db = db
@@ -120,7 +122,16 @@ class CodexAgentRuntime:
         runtime_state = dict(chat_session.runtime_state_json or {})
         workspace = self._ensure_workspace(chat_session.id)
         is_resume = bool(runtime_state.get("thread_id"))
-        prompt = self._build_prompt(request, chat_session, agent, user_message.id, is_resume)
+        message = request.message
+        attachment_text = _attachment_text(request)
+        if attachment_text:
+            message = f"{message}\n\n{attachment_text}"
+        system_prompt = self._system_prompt(agent)
+        prompt = message
+        if not is_resume:
+            history = self._history_text(chat_session, user_message.id)
+            if history:
+                prompt = f"[对话历史]\n{history}\n\n[用户消息]\n{message}"
         self._db.commit()
         self._db.refresh(chat_session)
         self._db.refresh(user_message)
@@ -133,13 +144,25 @@ class CodexAgentRuntime:
             runtime_state=runtime_state,
             workspace=workspace,
             prompt=prompt,
+            system_prompt=system_prompt,
             is_resume=is_resume,
         )
+
+    def _system_prompt(self, agent: AgentProfile | None) -> str:
+        sections: list[str] = []
+        if agent:
+            sections.append(AgentIdentityPrompt.render(agent))
+        sections.append(
+            "你可以通过名为 staffdeck 的 MCP 工具集访问该员工绑定的企业知识库"
+            "（query_knowledge）、业务工具（call_tool）与通用技能（run_general_skill）。"
+            "涉及企业数据、制度流程或业务系统时优先使用它们；不要编造企业内部信息。"
+        )
+        return "\n\n".join(sections)
 
     def _ensure_workspace(self, session_id: str) -> Path:
         root = (self._settings.codex_workspace_root or "").strip()
         base = Path(root) if root else paths.user_data_dir() / "workspaces"
-        workspace = base / session_id
+        workspace = base / f"{session_id}-claude"
         workspace.mkdir(parents=True, exist_ok=True)
         if not (workspace / ".git").exists():
             try:
@@ -153,34 +176,6 @@ class CodexAgentRuntime:
             except (OSError, subprocess.SubprocessError):
                 logger.debug("git init skipped for workspace %s", workspace)
         return workspace
-
-    def _build_prompt(
-        self,
-        request: ChatTurnRequest,
-        chat_session: ChatSession,
-        agent: AgentProfile | None,
-        user_message_id: str,
-        is_resume: bool,
-    ) -> str:
-        message = request.message
-        attachment_text = self._attachment_text(request)
-        if attachment_text:
-            message = f"{message}\n\n{attachment_text}"
-        if is_resume:
-            return message
-        sections: list[str] = []
-        if agent:
-            sections.append(AgentIdentityPrompt.render(agent))
-        sections.append(
-            "你可以通过名为 staffdeck 的 MCP 工具集访问该员工绑定的企业知识库"
-            "（query_knowledge）、业务工具（call_tool）与通用技能（run_general_skill）。"
-            "涉及企业数据、制度流程或业务系统时优先使用它们；不要编造企业内部信息。"
-        )
-        history = self._history_text(chat_session, user_message_id)
-        if history:
-            sections.append(f"[对话历史]\n{history}")
-        sections.append(f"[用户消息]\n{message}")
-        return "\n\n".join(section for section in sections if section.strip())
 
     def _history_text(self, chat_session: ChatSession, user_message_id: str) -> str:
         rows = list(
@@ -201,35 +196,29 @@ class CodexAgentRuntime:
                 lines.append(f"{speaker}：{content[:500]}")
         return "\n".join(lines[-_HISTORY_MESSAGE_LIMIT:])
 
-    @staticmethod
-    def _attachment_text(request: ChatTurnRequest) -> str:
-        parts: list[str] = []
-        for attachment in request.attachments:
-            if attachment.kind == "text" and attachment.text:
-                parts.append(f"[附件 {attachment.filename}]\n{attachment.text[:4000]}")
-        return "\n\n".join(parts)
-
     # ------------------------------------------------------------------
-    # codex invocation
+    # claude invocation
     # ------------------------------------------------------------------
 
     def _build_args(self, prepared: _PreparedTurn) -> list[str]:
-        args = [*_codex_base_command(self._settings), "exec"]
+        args = [
+            *_claude_base_command(self._settings),
+            "-p",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--permission-mode",
+            "bypassPermissions",
+            "--add-dir",
+            str(prepared.workspace),
+        ]
         if prepared.is_resume:
-            args += ["resume", str(prepared.runtime_state["thread_id"])]
-        args += ["-", "--json", "--skip-git-repo-check"]
-        if not prepared.is_resume:
-            args += ["-C", str(prepared.workspace)]
-        sandbox = str(prepared.runtime_config.get("sandbox") or "workspace-write")
-        if prepared.is_resume:
-            args += ["-c", f'sandbox_mode="{sandbox}"']
-        else:
-            args += ["-s", sandbox]
+            args += ["--resume", str(prepared.runtime_state["thread_id"])]
         model = str(
-            prepared.runtime_config.get("model") or self._settings.codex_default_model or ""
+            prepared.runtime_config.get("model") or self._settings.claude_code_default_model or ""
         )
         if model:
-            args += ["-m", model]
+            args += ["--model", model]
         token = issue_capability_token(
             tenant_id=prepared.request.tenant_id,
             agent_id=prepared.chat_session.agent_id or prepared.request.agent_id or "",
@@ -237,7 +226,13 @@ class CodexAgentRuntime:
             turn_id=prepared.user_message_id,
         )
         gateway_url = f"{self._settings.normalized_tool_base_url}/mcp/{token}"
-        args += ["-c", f'mcp_servers.staffdeck.url="{gateway_url}"']
+        mcp_config = json.dumps(
+            {"mcpServers": {"staffdeck": {"type": "http", "url": gateway_url}}},
+            ensure_ascii=False,
+        )
+        args += ["--strict-mcp-config", "--mcp-config", mcp_config]
+        if prepared.system_prompt.strip():
+            args += ["--append-system-prompt", prepared.system_prompt]
         return args
 
     # ------------------------------------------------------------------
@@ -268,16 +263,16 @@ class CodexAgentRuntime:
                 },
             )
         try:
-            yield from self._run_codex(prepared, streaming)
+            yield from self._run_claude(prepared, streaming)
         except Exception as exc:
-            logger.exception("codex turn failed (session=%s)", session.id)
-            yield from self._fail_turn(prepared, "CODEX_ADAPTER_ERROR", str(exc)[:300], streaming)
+            logger.exception("claude code turn failed (session=%s)", session.id)
+            yield from self._fail_turn(prepared, "CLAUDE_ADAPTER_ERROR", str(exc)[:300], streaming)
         finally:
             clear_chat_turn_cancelled(session.id, prepared.user_message_id)
             if prepared.request.client_turn_id:
                 clear_chat_turn_cancelled(session.id, prepared.request.client_turn_id)
 
-    def _run_codex(self, prepared: _PreparedTurn, streaming: bool) -> Iterator[dict[str, Any]]:
+    def _run_claude(self, prepared: _PreparedTurn, streaming: bool) -> Iterator[dict[str, Any]]:
         args = self._build_args(prepared)
         try:
             process = subprocess.Popen(
@@ -292,7 +287,7 @@ class CodexAgentRuntime:
             )
         except FileNotFoundError:
             yield from self._fail_turn(
-                prepared, "CODEX_CLI_NOT_FOUND", _CODEX_CLI_NOT_FOUND, streaming
+                prepared, "CLAUDE_CLI_NOT_FOUND", _CLAUDE_CLI_NOT_FOUND, streaming
             )
             return
         assert process.stdin is not None
@@ -314,13 +309,13 @@ class CodexAgentRuntime:
         threading.Thread(target=_reader, args=(process.stdout, "out"), daemon=True).start()
         threading.Thread(target=_reader, args=(process.stderr, "err"), daemon=True).start()
 
-        timeout = float(self._settings.codex_timeout_seconds or 900.0)
+        timeout = float(self._settings.claude_code_timeout_seconds or 900.0)
         deadline = time.monotonic() + timeout
         last_heartbeat = time.monotonic()
         stdout_open = True
         stderr_tail: list[str] = []
-        pending_agent_text: str | None = None
-        saw_agent_message = False
+        result_payload: dict[str, Any] | None = None
+        last_text_by_message: dict[str, str] = {}
         failure: tuple[str, str] | None = None
         cancelled = False
 
@@ -329,14 +324,14 @@ class CodexAgentRuntime:
                 cancelled = True
                 break
             if time.monotonic() > deadline:
-                failure = ("CODEX_TIMEOUT", f"Codex 执行超过 {timeout:g} 秒未结束")
+                failure = ("CLAUDE_TIMEOUT", f"Claude Code 执行超过 {timeout:g} 秒未结束")
                 break
             try:
                 tag, line = output_queue.get(timeout=0.2)
             except queue.Empty:
                 if streaming and time.monotonic() - last_heartbeat >= _HEARTBEAT_SECONDS:
                     last_heartbeat = time.monotonic()
-                    yield self._status(prepared, "responding", "Codex 正在执行…", streaming)
+                    yield self._status(prepared, "responding", "Claude Code 正在执行…", streaming)
                 if process.poll() is not None and output_queue.empty():
                     break
                 continue
@@ -354,52 +349,44 @@ class CodexAgentRuntime:
             if event is None:
                 continue
             event_type = event.get("type")
-            if event_type == "thread.started":
-                thread_id = str(event.get("thread_id") or "").strip()
-                if thread_id:
-                    prepared.runtime_state["thread_id"] = thread_id
+            if event_type == "system" and event.get("subtype") == "init":
+                session_id = str(event.get("session_id") or "").strip()
+                if session_id:
+                    prepared.runtime_state["thread_id"] = session_id
                     self._persist_runtime_state(prepared)
-            elif event_type == "item.completed":
-                item = event.get("item") if isinstance(event.get("item"), dict) else {}
-                item_type = item.get("type")
-                if item_type == "agent_message":
-                    saw_agent_message = True
-                    text = str(item.get("text") or "")
-                    if pending_agent_text is not None and streaming:
-                        yield self._status(
-                            prepared, _CODEX_PROGRESS_PHASE, pending_agent_text[:160], streaming
+            elif event_type == "assistant":
+                message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                message_id = str(message.get("id") or "")
+                content = message.get("content") if isinstance(message.get("content"), list) else []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if block_type == "text":
+                        text = str(block.get("text") or "")
+                        previous = last_text_by_message.get(message_id, "")
+                        suffix = text.removeprefix(previous) if text.startswith(previous) else text
+                        last_text_by_message[message_id] = text
+                        if streaming and suffix:
+                            for chunk in reply_chunks(suffix):
+                                yield self._event(
+                                    prepared, "stream_delta", {"content": chunk}, persist=True
+                                )
+                    elif block_type == "thinking":
+                        if streaming:
+                            thinking = str(block.get("thinking") or "").strip()
+                            if thinking:
+                                yield self._status(prepared, "stepping", thinking[:120], streaming)
+                    elif block_type == "tool_use":
+                        yield self._event(
+                            prepared,
+                            "tool_result",
+                            _tool_use_activity_payload(block),
+                            persist=True,
+                            streaming=streaming,
                         )
-                    pending_agent_text = text
-                    if streaming:
-                        for chunk in reply_chunks(text):
-                            yield self._event(
-                                prepared, "stream_delta", {"content": chunk}, persist=True
-                            )
-                elif item_type == "reasoning":
-                    if streaming:
-                        reasoning = str(item.get("text") or "").strip()
-                        if reasoning:
-                            yield self._status(prepared, "stepping", reasoning[:120], streaming)
-                elif item_type in {
-                    "command_execution",
-                    "file_change",
-                    "mcp_tool_call",
-                    "web_search",
-                }:
-                    yield self._event(
-                        prepared,
-                        "tool_result",
-                        _tool_activity_payload(item_type, item),
-                        persist=True,
-                        streaming=streaming,
-                    )
-            elif event_type == "turn.completed":
-                usage = event.get("usage") if isinstance(event.get("usage"), dict) else None
-                prepared.usage = usage
-            elif event_type in {"error", "turn.failed"}:
-                message = str(event.get("message") or event.get("error") or "Codex 执行失败")
-                failure = ("CODEX_EXEC_FAILED", message[:300])
-                break
+            elif event_type == "result":
+                result_payload = event
 
         if cancelled:
             kill_process_tree(process)
@@ -414,22 +401,29 @@ class CodexAgentRuntime:
             self._finalize(prepared, cancelled=True)
             return
 
-        if failure is None and process.poll() not in (0, None) and not saw_agent_message:
+        if result_payload is None:
             tail = "\n".join(stderr_tail[-5:])[:300]
-            failure = ("CODEX_EXEC_FAILED", tail or f"codex 进程退出码 {process.returncode}")
-        if failure is None and not saw_agent_message:
-            tail = "\n".join(stderr_tail[-5:])[:300]
-            failure = ("CODEX_EMPTY_REPLY", tail or "Codex 未返回任何回复")
+            failure = failure or (
+                "CLAUDE_NO_RESULT",
+                tail or f"claude 进程退出码 {process.returncode}",
+            )
+        elif result_payload.get("is_error"):
+            message = str(result_payload.get("result") or result_payload.get("subtype") or "")
+            failure = failure or ("CLAUDE_EXEC_FAILED", message[:300] or "Claude Code 执行失败")
 
         if failure is not None:
             kill_process_tree(process)
             yield from self._fail_turn(prepared, failure[0], failure[1], streaming)
             return
 
-        process.wait(timeout=5)
-        prepared.reply = (pending_agent_text or "").strip() or "（Codex 未返回文本回复）"
-        if streaming and prepared.reply != (pending_agent_text or ""):
-            yield self._event(prepared, "stream_replace", {"content": prepared.reply}, persist=True)
+        usage = result_payload.get("usage") if isinstance(result_payload.get("usage"), dict) else {}
+        if result_payload.get("total_cost_usd") is not None:
+            usage = {**usage, "total_cost_usd": result_payload["total_cost_usd"]}
+        prepared.usage = usage or None
+        reply = str(result_payload.get("result") or "").strip()
+        if not reply and last_text_by_message:
+            reply = max(last_text_by_message.values(), key=len).strip()
+        prepared.reply = reply or "（Claude Code 未返回文本回复）"
         self._finalize(prepared)
         if streaming:
             yield self._event(prepared, "stream_end", {}, persist=True)
@@ -449,16 +443,16 @@ class CodexAgentRuntime:
     def _finalize(self, prepared: _PreparedTurn, cancelled: bool = False) -> None:
         session = prepared.chat_session
         state = dict(prepared.runtime_state)
-        state["runtime"] = AgentRuntimeKind.CODEX.value
+        state["runtime"] = AgentRuntimeKind.CLAUDE_CODE.value
         state["workspace"] = str(prepared.workspace)
         state["turn_count"] = int(state.get("turn_count") or 0) + 1
         session.runtime_state_json = state
         self._db.add(session)
-        extra_metadata: dict[str, Any] = {"runtime": AgentRuntimeKind.CODEX.value}
+        extra_metadata: dict[str, Any] = {"runtime": AgentRuntimeKind.CLAUDE_CODE.value}
         if prepared.usage:
-            extra_metadata["codex_usage"] = prepared.usage
+            extra_metadata["claude_usage"] = prepared.usage
         if state.get("thread_id"):
-            extra_metadata["codex_thread_id"] = state["thread_id"]
+            extra_metadata["claude_session_id"] = state["thread_id"]
         if cancelled:
             extra_metadata["status"] = "cancelled"
         bookkeeping.finalize_simple_turn(
@@ -493,7 +487,7 @@ class CodexAgentRuntime:
             {"code": code, "message": message},
         )
         self._db.commit()
-        prepared.reply = f"Codex 执行失败:{message}"
+        prepared.reply = f"Claude Code 执行失败:{message}"
         self._finalize(prepared)
         if streaming:
             yield self._event(
@@ -555,7 +549,7 @@ class CodexAgentRuntime:
     def _persist_runtime_state(self, prepared: _PreparedTurn) -> None:
         session = prepared.chat_session
         state = dict(prepared.runtime_state)
-        state["runtime"] = AgentRuntimeKind.CODEX.value
+        state["runtime"] = AgentRuntimeKind.CLAUDE_CODE.value
         state["workspace"] = str(prepared.workspace)
         session.runtime_state_json = state
         session.updated_at = utc_now()
@@ -568,16 +562,16 @@ class CodexAgentRuntime:
 # ----------------------------------------------------------------------
 
 
-def codex_cli_available(settings: Any | None = None) -> bool:
+def claude_cli_available(settings: Any | None = None) -> bool:
     settings = settings or get_settings()
-    configured = (settings.codex_cli_path or "").strip()
+    configured = (settings.claude_code_cli_path or "").strip()
     if configured:
         return Path(configured).exists()
-    return shutil.which("codex") is not None
+    return shutil.which("claude") is not None
 
 
-def _codex_base_command(settings: Any) -> list[str]:
-    raw = (settings.codex_cli_path or "").strip() or (shutil.which("codex") or "codex")
+def _claude_base_command(settings: Any) -> list[str]:
+    raw = (settings.claude_code_cli_path or "").strip() or (shutil.which("claude") or "claude")
     lowered = raw.lower()
     if lowered.endswith(".py"):
         return [sys.executable, raw]
@@ -586,56 +580,23 @@ def _codex_base_command(settings: Any) -> list[str]:
     return [raw]
 
 
-def _tool_activity_payload(item_type: str, item: dict[str, Any]) -> dict[str, Any]:
-    """Map a codex item onto the AgentLoop tool_result activity shape."""
-    if item_type == "command_execution":
-        command = str(item.get("command") or "")
-        exit_code = item.get("exit_code")
-        success = exit_code in (0, None)
-        content = {
-            "command": command,
-            "exit_code": exit_code,
-            "output": str(item.get("aggregated_output") or "")[:2000],
-        }
-        return {
-            "toolId": "codex.command",
-            "toolName": "执行命令",
-            "rawToolName": "codex.command",
-            "content": content,
-            "arguments": {"command": command},
-            "success": success,
-            "isError": not success,
-        }
-    if item_type == "file_change":
-        changes = item.get("changes") if isinstance(item.get("changes"), list) else []
-        return {
-            "toolId": "codex.file_change",
-            "toolName": "修改文件",
-            "rawToolName": "codex.file_change",
-            "content": {"changes": changes},
-            "arguments": {"changes": changes},
-            "success": True,
-            "isError": False,
-        }
-    if item_type == "mcp_tool_call":
-        server = str(item.get("server") or "")
-        tool = str(item.get("tool") or "")
-        label = f"{server}.{tool}".strip(".")
-        return {
-            "toolId": f"mcp.{label}",
-            "toolName": label,
-            "rawToolName": label,
-            "content": item.get("result") if "result" in item else item.get("output"),
-            "arguments": item.get("arguments") if isinstance(item.get("arguments"), dict) else {},
-            "success": not item.get("error"),
-            "isError": bool(item.get("error")),
-        }
+def _attachment_text(request: ChatTurnRequest) -> str:
+    parts: list[str] = []
+    for attachment in request.attachments:
+        if attachment.kind == "text" and attachment.text:
+            parts.append(f"[附件 {attachment.filename}]\n{attachment.text[:4000]}")
+    return "\n\n".join(parts)
+
+
+def _tool_use_activity_payload(block: dict[str, Any]) -> dict[str, Any]:
+    name = str(block.get("name") or "tool")
+    arguments = block.get("input") if isinstance(block.get("input"), dict) else {}
     return {
-        "toolId": f"codex.{item_type}",
-        "toolName": item_type,
-        "rawToolName": f"codex.{item_type}",
-        "content": item,
-        "arguments": {},
+        "toolId": f"claude.{name}",
+        "toolName": name,
+        "rawToolName": f"claude.{name}",
+        "content": {"input": arguments},
+        "arguments": arguments,
         "success": True,
         "isError": False,
     }
