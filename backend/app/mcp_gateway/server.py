@@ -13,7 +13,7 @@ from app.mcp_gateway.tools import GatewayToolError, execute_gateway_tool, gatewa
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/mcp", tags=["mcp-gateway"])
+router = APIRouter(prefix="/api/mcp", tags=["mcp-gateway"])
 
 PROTOCOL_VERSION = "2024-11-05"
 _SERVER_INFO = {"name": "staffdeck-capability-gateway", "version": "1.0.0"}

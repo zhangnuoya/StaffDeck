@@ -220,8 +220,14 @@ class CodexAgentRuntime:
         args += ["-", "--json", "--skip-git-repo-check"]
         if not prepared.is_resume:
             args += ["-C", str(prepared.workspace)]
-        sandbox = str(prepared.runtime_config.get("sandbox") or "workspace-write")
-        if prepared.is_resume:
+        sandbox = str(prepared.runtime_config.get("sandbox") or "bypass")
+        if sandbox == "bypass":
+            # 非交互服务场景无人能点“批准”；审批层（approval_policy=never）会
+            # 把 MCP 工具调用自动取消，且 Windows 沙箱会拦截 pwsh。默认完全绕过
+            # 审批与沙箱（与 claude_code 适配器的 bypassPermissions 同一姿态），
+            # 收紧环境可用 runtime_config.sandbox = workspace-write / read-only 回退。
+            args += ["--dangerously-bypass-approvals-and-sandbox"]
+        elif prepared.is_resume:
             args += ["-c", f'sandbox_mode="{sandbox}"']
         else:
             args += ["-s", sandbox]
@@ -236,7 +242,7 @@ class CodexAgentRuntime:
             session_id=prepared.chat_session.id,
             turn_id=prepared.user_message_id,
         )
-        gateway_url = f"{self._settings.normalized_tool_base_url}/mcp/{token}"
+        gateway_url = f"{self._settings.normalized_tool_base_url}/api/mcp/{token}"
         args += ["-c", f'mcp_servers.staffdeck.url="{gateway_url}"']
         return args
 

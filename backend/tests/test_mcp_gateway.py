@@ -148,7 +148,7 @@ def test_capability_token_rejects_tampering_and_expiry() -> None:
 def test_endpoint_rejects_invalid_token() -> None:
     with _make_db() as db:
         client = _make_client(db)
-        response = client.post("/mcp/not-a-token", json=_rpc("initialize"))
+        response = client.post("/api/mcp/not-a-token", json=_rpc("initialize"))
         assert response.status_code == 401
 
 
@@ -157,20 +157,20 @@ def test_initialize_and_tools_list() -> None:
         _seed(db)
         client = _make_client(db)
         token = _token()
-        init = client.post(f"/mcp/{token}", json=_rpc("initialize"))
+        init = client.post(f"/api/mcp/{token}", json=_rpc("initialize"))
         assert init.status_code == 200
         result = init.json()["result"]
         assert result["protocolVersion"] == "2024-11-05"
         assert result["serverInfo"]["name"] == "staffdeck-capability-gateway"
 
-        notification = client.post(f"/mcp/{token}", json=_rpc("notifications/initialized"))
+        notification = client.post(f"/api/mcp/{token}", json=_rpc("notifications/initialized"))
         assert notification.status_code == 202
 
-        listed = client.post(f"/mcp/{token}", json=_rpc("tools/list"))
+        listed = client.post(f"/api/mcp/{token}", json=_rpc("tools/list"))
         names = {tool["name"] for tool in listed.json()["result"]["tools"]}
         assert names == {"query_knowledge", "call_tool", "run_general_skill"}
 
-        unknown = client.post(f"/mcp/{token}", json=_rpc("resources/list"))
+        unknown = client.post(f"/api/mcp/{token}", json=_rpc("resources/list"))
         assert unknown.json()["error"]["code"] == -32601
 
 
@@ -195,7 +195,7 @@ def test_call_tool_success_path_is_fully_real() -> None:
         _seed(db)
         client = _make_client(db)
         response = client.post(
-            f"/mcp/{_token()}",
+            f"/api/mcp/{_token()}",
             json=_rpc(
                 "tools/call",
                 {
@@ -239,7 +239,7 @@ def test_call_tool_rejects_unbound_tool() -> None:
         db.commit()
         client = _make_client(db)
         response = client.post(
-            f"/mcp/{_token()}",
+            f"/api/mcp/{_token()}",
             json=_rpc("tools/call", {"name": "call_tool", "arguments": {"name": "other.tool"}}),
         )
         payload = response.json()["result"]
@@ -252,7 +252,7 @@ def test_query_knowledge_requires_bound_knowledge_base() -> None:
         _seed(db)  # kb_policy exists but is NOT bound to agent_codex
         client = _make_client(db)
         response = client.post(
-            f"/mcp/{_token()}",
+            f"/api/mcp/{_token()}",
             json=_rpc(
                 "tools/call", {"name": "query_knowledge", "arguments": {"query": "报销流程"}}
             ),
@@ -267,7 +267,7 @@ def test_run_general_skill_rejects_unbound_or_unpublished() -> None:
         _seed(db)  # data-clean published but NOT bound to agent_codex
         client = _make_client(db)
         unbound = client.post(
-            f"/mcp/{_token()}",
+            f"/api/mcp/{_token()}",
             json=_rpc(
                 "tools/call",
                 {"name": "run_general_skill", "arguments": {"slug": "data-clean", "query": "清洗"}},
@@ -277,7 +277,7 @@ def test_run_general_skill_rejects_unbound_or_unpublished() -> None:
         assert "未绑定该通用技能" in unbound.json()["result"]["content"][0]["text"]
 
         missing = client.post(
-            f"/mcp/{_token()}",
+            f"/api/mcp/{_token()}",
             json=_rpc(
                 "tools/call",
                 {"name": "run_general_skill", "arguments": {"slug": "no-such", "query": "x"}},
@@ -292,7 +292,7 @@ def test_unknown_gateway_tool_is_a_jsonrpc_error() -> None:
         _seed(db)
         client = _make_client(db)
         response = client.post(
-            f"/mcp/{_token()}",
+            f"/api/mcp/{_token()}",
             json=_rpc("tools/call", {"name": "delete_everything", "arguments": {}}),
         )
         assert response.json()["error"]["code"] == -32602
@@ -303,7 +303,7 @@ def test_token_scopes_audit_to_its_own_session() -> None:
         _seed(db)
         client = _make_client(db)
         client.post(
-            f"/mcp/{_token(session_id='session_a')}",
+            f"/api/mcp/{_token(session_id='session_a')}",
             json=_rpc(
                 "tools/call",
                 {

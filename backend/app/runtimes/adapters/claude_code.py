@@ -225,7 +225,7 @@ class ClaudeCodeAgentRuntime:
             session_id=prepared.chat_session.id,
             turn_id=prepared.user_message_id,
         )
-        gateway_url = f"{self._settings.normalized_tool_base_url}/mcp/{token}"
+        gateway_url = f"{self._settings.normalized_tool_base_url}/api/mcp/{token}"
         mcp_config = json.dumps(
             {"mcpServers": {"staffdeck": {"type": "http", "url": gateway_url}}},
             ensure_ascii=False,

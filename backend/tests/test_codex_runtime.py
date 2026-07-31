@@ -130,6 +130,8 @@ def test_handle_turn_end_to_end_with_fake_cli(codex_settings, tmp_path) -> None:
         argv_text = " ".join(capture["argv"])
         assert "exec" in capture["argv"]
         assert "--json" in capture["argv"]
+        # 默认完全绕过审批与沙箱（runtime_config.sandbox 可回退 workspace-write）
+        assert "--dangerously-bypass-approvals-and-sandbox" in capture["argv"]
         assert "resume" not in capture["argv"]
         assert "fake-codex-model" in argv_text
         assert "staffdeck" in capture["prompt"] or "企业知识库" in capture["prompt"]
