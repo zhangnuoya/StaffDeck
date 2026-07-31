@@ -29,6 +29,7 @@ from app.channels import start_channel_services, stop_channel_services
 from app.config import get_settings
 from app.db import engine, init_db
 from app.db.seed import seed_demo_data
+from app.mcp_gateway.server import router as mcp_gateway_router
 from app.scheduled_tasks.worker import start_background_worker, stop_background_worker
 
 settings = get_settings()
@@ -95,3 +96,4 @@ app.include_router(tools.mcp_router)
 app.include_router(sessions.router)
 app.include_router(traces.router)
 app.include_router(mock.router)
+app.include_router(mcp_gateway_router)
