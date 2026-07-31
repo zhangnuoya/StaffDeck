@@ -83,7 +83,10 @@ def test_create_runtime_returns_native_adapter() -> None:
     assert runtime.runtime_kind == AgentRuntimeKind.NATIVE
 
 
-def test_create_runtime_rejects_unavailable_kinds() -> None:
+def test_create_runtime_rejects_unavailable_kinds(monkeypatch) -> None:
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "codex_cli_path", "/nonexistent/codex.exe")
     with _make_db() as db:
         for kind in (AgentRuntimeKind.CODEX, AgentRuntimeKind.CLAUDE_CODE):
             with pytest.raises(RuntimeUnavailableError) as excinfo:

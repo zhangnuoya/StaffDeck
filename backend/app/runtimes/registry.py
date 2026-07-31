@@ -21,6 +21,12 @@ def create_runtime(db: Session, kind: AgentRuntimeKind) -> AgentRuntime:
     """
     if kind == AgentRuntimeKind.NATIVE:
         return NativeAgentRuntime(db)
+    if kind == AgentRuntimeKind.CODEX:
+        from app.runtimes.adapters.codex import CodexAgentRuntime, codex_cli_available
+
+        if not codex_cli_available():
+            raise RuntimeUnavailableError(kind, "codex CLI 未安装或未配置 codex_cli_path")
+        return CodexAgentRuntime(db)
     raise RuntimeUnavailableError(kind)
 
 

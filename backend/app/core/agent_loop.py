@@ -98,6 +98,7 @@ from app.memory.jobs import enqueue_memory_capture
 from app.memory.service import MemoryService, memory_read
 from app.observability import EventLog
 from app.observability.spans import llm_operation
+from app.runtimes import bookkeeping as turn_bookkeeping
 from app.session.helpers import public_session
 from app.session.session_schema import (
     ChatTurnRequest,
@@ -4820,20 +4821,7 @@ class AgentLoop:
         )
 
     def _get_or_create_session(self, request: ChatTurnRequest) -> ChatSession:
-        session_id = request.session_id or new_id("session")
-        chat_session = self.db.get(ChatSession, session_id)
-        if not chat_session:
-            chat_session = ChatSession(
-                id=session_id,
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
-                agent_id=request.agent_id,
-            )
-            self.db.add(chat_session)
-            self.db.flush()
-        elif not chat_session.agent_id and request.agent_id:
-            chat_session.agent_id = request.agent_id
-        return chat_session
+        return turn_bookkeeping.get_or_create_session(self.db, request)
 
     def _finish_stale_completed_skill(
         self, tenant_id: str, chat_session: ChatSession, skills: list[Skill]
@@ -5444,15 +5432,9 @@ class AgentLoop:
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> Message:
-        message = Message(
-            tenant_id=tenant_id,
-            session_id=session_id,
-            role=role,
-            content=content,
-            metadata_json=metadata or {},
+        return turn_bookkeeping.append_message(
+            self.db, tenant_id, session_id, role, content, metadata
         )
-        self.db.add(message)
-        return message
 
     def _persist_cancelled_assistant_message(
         self,

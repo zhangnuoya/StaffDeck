@@ -147,6 +147,9 @@ def _migrate_sqlite_skill_schema() -> None:
             if "context_state_json" not in session_columns:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN context_state_json JSON"))
                 conn.execute(text("UPDATE sessions SET context_state_json = '{}'"))
+            if "runtime_state_json" not in session_columns:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN runtime_state_json JSON"))
+                conn.execute(text("UPDATE sessions SET runtime_state_json = '{}'"))
             if "channel" not in session_columns:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN channel VARCHAR"))
             if "external_conv_id" not in session_columns:
