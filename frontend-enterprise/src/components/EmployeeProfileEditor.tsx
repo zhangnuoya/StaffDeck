@@ -219,10 +219,10 @@ export default function EmployeeProfileEditor({
                   </Select>
                 </LabeledField>
                 {form.runtime === AgentRuntime.Codex && (
-                  <LabeledField label="Codex 模型">
+                  <LabeledField label="模型覆盖">
                     <Input
                       value={form.codexModel}
-                      placeholder="例如：gpt-5-codex（留空用 CLI 默认）"
+                      placeholder="留空则跟随「模型」页的默认模型"
                       onChange={(event) => update({ codexModel: event.target.value })}
                     />
                   </LabeledField>

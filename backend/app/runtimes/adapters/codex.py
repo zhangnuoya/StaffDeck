@@ -13,9 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
 from sqlmodel import Session, select
 
 from app import paths
+from app.agents.branching import model_for_agent
 from app.config import get_settings
 from app.core.agent_identity_prompt import AgentIdentityPrompt
 from app.core.cancellation import clear_chat_turn_cancelled, is_chat_turn_cancelled
@@ -213,6 +215,21 @@ class CodexAgentRuntime:
     # codex invocation
     # ------------------------------------------------------------------
 
+    def _resolve_model(self, prepared: _PreparedTurn) -> str:
+        """优先级：runtime_config 覆盖 > AgentModelBinding/默认 > 全局配置 > 不传。"""
+        override = str(prepared.runtime_config.get("model") or "").strip()
+        if override:
+            return override
+        agent_id = prepared.chat_session.agent_id or prepared.request.agent_id
+        if agent_id:
+            try:
+                resolved = model_for_agent(self._db, prepared.request.tenant_id, agent_id)
+                if resolved and resolved.model:
+                    return resolved.model
+            except HTTPException:
+                pass  # 模型未验证等：回退全局配置
+        return str(self._settings.codex_default_model or "").strip()
+
     def _build_args(self, prepared: _PreparedTurn) -> list[str]:
         args = [*_codex_base_command(self._settings), "exec"]
         if prepared.is_resume:
@@ -231,9 +248,7 @@ class CodexAgentRuntime:
             args += ["-c", f'sandbox_mode="{sandbox}"']
         else:
             args += ["-s", sandbox]
-        model = str(
-            prepared.runtime_config.get("model") or self._settings.codex_default_model or ""
-        )
+        model = self._resolve_model(prepared)
         if model:
             args += ["-m", model]
         token = issue_capability_token(

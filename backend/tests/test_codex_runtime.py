@@ -10,7 +10,7 @@ from sqlmodel.pool import StaticPool
 
 from app.config import get_settings
 from app.core.cancellation import cancel_chat_turn
-from app.db.models import AgentEvent, AgentProfile, ChatSession, Message, Tenant
+from app.db.models import AgentEvent, AgentProfile, ChatSession, Message, ModelConfig, Tenant
 from app.mcp_gateway import verify_capability_token
 from app.runtimes import (
     AgentRuntimeKind,
@@ -274,3 +274,64 @@ def test_cancellation_stops_stream(codex_settings, monkeypatch) -> None:
         kinds = [event["event"] for event in events]
         assert "stream_cancelled" in kinds
         assert "complete" not in kinds
+
+
+def test_model_follows_models_page_default(codex_settings, monkeypatch) -> None:
+    """不设 runtime_config.model 时，-m 跟随 Models 页的租户默认模型。"""
+    with _make_db() as db:
+        _seed(db)
+        # 清掉 runtime_config.model，让适配器走 model_for_agent 回退
+        agent = db.get(AgentProfile, "agent_codex")
+        agent.runtime_config_json = {}
+        db.add(
+            ModelConfig(
+                id="model_default",
+                tenant_id="tenant_demo",
+                name="默认模型",
+                model="staffdeck-default-model",
+                is_default=True,
+                enabled=True,
+                api_protocol="openai_chat_completions",
+                api_key_encrypted="encrypted",
+                trust_status="legacy_trusted",
+            )
+        )
+        db.commit()
+        list(CodexAgentRuntime(db).handle_turn_stream(_request()))
+        # capture 由 fake CLI 写入 FAKE_CODEX_CAPTURE
+        import json as _json
+        from pathlib import Path as _Path
+
+        capture_path = _Path(__import__("os").environ["FAKE_CODEX_CAPTURE"])
+        capture = _json.loads(capture_path.read_text(encoding="utf-8"))
+        assert "-m" in capture["argv"]
+        idx = capture["argv"].index("-m")
+        assert capture["argv"][idx + 1] == "staffdeck-default-model"
+
+
+def test_runtime_config_model_overrides_default(codex_settings, monkeypatch) -> None:
+    """runtime_config.model 优先于 model_for_agent。"""
+    with _make_db() as db:
+        _seed(db)  # runtime_config_json={"model": "fake-codex-model"}
+        db.add(
+            ModelConfig(
+                id="model_default",
+                tenant_id="tenant_demo",
+                name="默认模型",
+                model="staffdeck-default-model",
+                is_default=True,
+                enabled=True,
+                api_protocol="openai_chat_completions",
+                api_key_encrypted="encrypted",
+                trust_status="legacy_trusted",
+            )
+        )
+        db.commit()
+        list(CodexAgentRuntime(db).handle_turn_stream(_request()))
+        import json as _json
+        from pathlib import Path as _Path
+
+        capture_path = _Path(__import__("os").environ["FAKE_CODEX_CAPTURE"])
+        capture = _json.loads(capture_path.read_text(encoding="utf-8"))
+        idx = capture["argv"].index("-m")
+        assert capture["argv"][idx + 1] == "fake-codex-model"
