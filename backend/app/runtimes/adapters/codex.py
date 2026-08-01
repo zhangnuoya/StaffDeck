@@ -172,9 +172,9 @@ class CodexAgentRuntime:
         if agent:
             sections.append(AgentIdentityPrompt.render(agent))
         sections.append(
-            "你可以通过名为 staffdeck 的 MCP 工具集访问该员工绑定的企业知识库"
-            "（query_knowledge）、业务工具（call_tool）与通用技能（run_general_skill）。"
-            "涉及企业数据、制度流程或业务系统时优先使用它们；不要编造企业内部信息。"
+            "你能通过名为 staffdeck 的 MCP 工具集访问该员工绑定的企业能力。"
+            "业务工具已按原生名称在工具清单中列出，请直接按名调用（不要用 call_tool 包装）；"
+            "知识库检索用 query_knowledge，通用技能用 run_general_skill。不要编造企业内部信息。"
         )
         history = self._history_text(chat_session, user_message_id)
         if history:

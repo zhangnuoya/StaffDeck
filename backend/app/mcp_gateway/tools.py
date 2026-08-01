@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from sqlmodel import Session, select
 
-from app.agents.branching import model_for_agent, visible_knowledge_base_ids
+from app.agents.branching import model_for_agent, visible_knowledge_base_ids, visible_tool_rows
 from app.capabilities.contracts import CapabilityContext
 from app.capabilities.local_general_skill import LocalGeneralSkillCatalog
 from app.db.models import GeneralSkill, new_id
@@ -22,12 +23,17 @@ logger = logging.getLogger(__name__)
 
 GATEWAY_ORIGIN = "mcp_gateway"
 
+# MCP 工具名必须匹配 ^[a-zA-Z0-9_-]{1,64}$；StaffDeck 的 Tool.name 是 `{server}.{leaf}`，
+# 含点号且 server 段可能重复。消毒为下划线分隔并保留一份「消毒名 -> 真实名」的映射。
+_MCP_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
+_BUILTIN_TOOL_NAMES = {"query_knowledge", "call_tool", "run_general_skill"}
+
 
 class GatewayToolError(Exception):
     """Raised for protocol-level failures (unknown tool, bad arguments)."""
 
 
-def gateway_tool_descriptors() -> list[dict[str, Any]]:
+def _builtin_tool_descriptors() -> list[dict[str, Any]]:
     return [
         {
             "name": "query_knowledge",
@@ -50,9 +56,9 @@ def gateway_tool_descriptors() -> list[dict[str, Any]]:
         {
             "name": "call_tool",
             "description": (
-                "Invoke an enterprise tool (HTTP/MCP) that is bound to this digital employee, "
-                "e.g. ticket systems, CRM lookups. Use list tools on the employee profile to "
-                "discover names."
+                "Invoke an enterprise tool by name. Prefer calling bound tools by their "
+                "native name directly (they are listed alongside this one); this wrapper "
+                "is only a fallback."
             ),
             "inputSchema": {
                 "type": "object",
@@ -81,13 +87,79 @@ def gateway_tool_descriptors() -> list[dict[str, Any]]:
     ]
 
 
+def gateway_tool_descriptors(db: Session, grant: CapabilityGrant) -> list[dict[str, Any]]:
+    """Return the tools this agent can see: the three builtins plus every bound Tool
+    rendered with its native name and ``inputSchema`` so external runtimes (Codex,
+    Claude Code) discover and call them directly instead of via ``call_tool``.
+    """
+    descriptors = _builtin_tool_descriptors()
+    seen = {entry["name"] for entry in descriptors}
+    tools = visible_tool_rows(db, grant.tenant_id, grant.agent_id, include_inactive=False)
+    for tool in tools:
+        sanitized = _sanitize_tool_name(tool.name)
+        if not sanitized or sanitized in _BUILTIN_TOOL_NAMES or sanitized in seen:
+            if sanitized in _BUILTIN_TOOL_NAMES:
+                logger.warning(
+                    "tool %r sanitizes to builtin name %r; hidden from MCP list",
+                    tool.name,
+                    sanitized,
+                )
+            continue
+        descriptors.append(
+            {
+                "name": sanitized,
+                "description": str(tool.description or tool.display_name or tool.name),
+                "inputSchema": tool.input_schema or {"type": "object"},
+            }
+        )
+        seen.add(sanitized)
+    return descriptors
+
+
+def _sanitize_tool_name(name: str) -> str:
+    """``github.create_issue`` -> ``github_create_issue``; trim to 64 chars."""
+    sanitized = _MCP_NAME_RE.sub("_", str(name or "")).strip("_")
+    return sanitized[:64]
+
+
 def execute_gateway_tool(
     db: Session,
     grant: CapabilityGrant,
     name: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run one gateway tool with audit events; returns an MCP tool-result dict."""
+    """Run one gateway tool with audit events; returns an MCP tool-result dict.
+
+    ``name`` may be one of the three builtins or the sanitized name of a bound
+    Tool (resolved back to its real DB name before dispatch).
+    """
+    builtin_runner = _BUILTIN_RUNNERS.get(name)
+    if builtin_runner is not None:
+        return _run_with_audit(db, grant, name, name, arguments, builtin_runner)
+    native = _resolve_native_tool(db, grant, name)
+    if native is None:
+        raise GatewayToolError(f"unknown tool: {name}")
+    real_name, display_name = native
+
+    def runner(db: Session, grant: CapabilityGrant, arguments: dict[str, Any]) -> ToolResult:
+        # ToolExecutor enforces enabled + agent binding (visible_tool_rows) again.
+        return ToolExecutor(db).execute(
+            grant.tenant_id,
+            ToolCall(name=real_name, arguments=arguments),
+            agent_id=grant.agent_id,
+        )
+
+    return _run_with_audit(db, grant, name, display_name or real_name, arguments, runner)
+
+
+def _run_with_audit(
+    db: Session,
+    grant: CapabilityGrant,
+    requested_name: str,
+    activity_name: str,
+    arguments: dict[str, Any],
+    runner,
+) -> dict[str, Any]:
     tool_call_id = new_id("call")
     events = EventLog(db)
     events.bind_turn(grant.turn_id)
@@ -98,17 +170,10 @@ def execute_gateway_tool(
         {
             "tool_call_id": tool_call_id,
             "origin": GATEWAY_ORIGIN,
-            "tool_call": {"name": name, "arguments": arguments},
+            "tool_call": {"name": requested_name, "arguments": arguments},
         },
     )
-    if name == "query_knowledge":
-        result = _query_knowledge(db, grant, arguments)
-    elif name == "call_tool":
-        result = _call_tool(db, grant, arguments)
-    elif name == "run_general_skill":
-        result = _run_general_skill(db, grant, arguments)
-    else:
-        raise GatewayToolError(f"unknown tool: {name}")
+    result = runner(db, grant, arguments)
     events.record(
         grant.tenant_id,
         grant.session_id,
@@ -116,7 +181,7 @@ def execute_gateway_tool(
         {
             "tool_call_id": tool_call_id,
             "origin": GATEWAY_ORIGIN,
-            "tool_call": {"name": name, "arguments": arguments},
+            "tool_call": {"name": requested_name, "arguments": arguments},
             "tool_result": result.model_dump(mode="json"),
         },
     )
@@ -124,28 +189,44 @@ def execute_gateway_tool(
         grant.tenant_id,
         grant.session_id,
         "tool_result",
-        _activity_payload(grant, name, result, arguments, tool_call_id),
+        _activity_payload(grant, requested_name, activity_name, result, arguments, tool_call_id),
     )
     db.commit()
     return _mcp_tool_result(result)
 
 
+def _resolve_native_tool(
+    db: Session, grant: CapabilityGrant, requested_name: str
+) -> tuple[str, str] | None:
+    """Map a sanitized requested name back to the agent's bound Tool row.
+
+    Multiple Tools may sanitize to the same name; the first bound one wins.
+    Returns ``(real_name, display_name)``.
+    """
+    tools = visible_tool_rows(db, grant.tenant_id, grant.agent_id, include_inactive=False)
+    for tool in tools:
+        if _sanitize_tool_name(tool.name) == requested_name:
+            return tool.name, str(tool.display_name or tool.name)
+    return None
+
+
 def _activity_payload(
     grant: CapabilityGrant,
-    name: str,
+    requested_name: str,
+    activity_name: str,
     result: ToolResult,
     arguments: dict[str, Any],
     tool_call_id: str,
 ) -> dict[str, Any]:
     """Mirror AgentLoop._tool_activity_payload so frontend tool cards render as-is."""
     return {
-        "toolId": name,
-        "toolName": name,
-        "rawToolName": name,
+        "toolId": requested_name,
+        "toolName": activity_name,
+        "rawToolName": requested_name,
         "content": result.model_dump(mode="json"),
         "isError": not result.success,
         "success": result.success,
-        "toolCall": {"name": name, "arguments": arguments},
+        "toolCall": {"name": requested_name, "arguments": arguments},
         "arguments": arguments,
         "toolCallId": tool_call_id,
         "origin": GATEWAY_ORIGIN,
@@ -166,6 +247,15 @@ def _mcp_tool_result(result: ToolResult) -> dict[str, Any]:
         "content": [{"type": "text", "text": text or "(empty result)"}],
         "isError": not result.success,
     }
+
+
+# Builtin runners keyed by their tool name; native (bound-Tool) names resolve
+# at call time via _resolve_native_tool and are dispatched through ToolExecutor.
+_BUILTIN_RUNNERS: dict[str, Any] = {
+    "query_knowledge": lambda db, grant, args: _query_knowledge(db, grant, args),
+    "call_tool": lambda db, grant, args: _call_tool(db, grant, args),
+    "run_general_skill": lambda db, grant, args: _run_general_skill(db, grant, args),
+}
 
 
 def _error_result(name: str, code: str, message: str) -> ToolResult:

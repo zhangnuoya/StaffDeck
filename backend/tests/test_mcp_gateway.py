@@ -167,8 +167,13 @@ def test_initialize_and_tools_list() -> None:
         assert notification.status_code == 202
 
         listed = client.post(f"/api/mcp/{token}", json=_rpc("tools/list"))
-        names = {tool["name"] for tool in listed.json()["result"]["tools"]}
-        assert names == {"query_knowledge", "call_tool", "run_general_skill"}
+        tools = listed.json()["result"]["tools"]
+        names = {tool["name"] for tool in tools}
+        # 三件套 + _seed 绑定的 demo.echo（消毒为 demo_echo）
+        assert {"query_knowledge", "call_tool", "run_general_skill"} <= names
+        assert "demo_echo" in names
+        echo = next(tool for tool in tools if tool["name"] == "demo_echo")
+        assert echo["inputSchema"] == {"type": "object"}
 
         unknown = client.post(f"/api/mcp/{token}", json=_rpc("resources/list"))
         assert unknown.json()["error"]["code"] == -32601
@@ -315,3 +320,99 @@ def test_token_scopes_audit_to_its_own_session() -> None:
         other = list(db.exec(select(AgentEvent).where(AgentEvent.session_id == "session_a")).all())
         assert other
         assert {event.tenant_id for event in other} == {"tenant_demo"}
+
+
+def test_native_tool_call_bypasses_call_tool_wrapper() -> None:
+    """按消毒名直接调 demo_echo，不经 call_tool 包装。"""
+    with _make_db() as db:
+        _seed(db)
+        client = _make_client(db)
+        response = client.post(
+            f"/api/mcp/{_token()}",
+            json=_rpc(
+                "tools/call",
+                {"name": "demo_echo", "arguments": {"text": "原生直调"}},
+            ),
+        )
+        payload = response.json()["result"]
+        assert payload["isError"] is False
+        assert "原生直调" in payload["content"][0]["text"]
+
+        finished = _gateway_events(db, "tool_call_finished")
+        assert len(finished) == 1
+        detail = finished[0].payload_json
+        # 请求名是消毒后的 demo_echo（模型所见），工具卡片名也是它
+        assert detail["tool_call"]["name"] == "demo_echo"
+        assert detail["origin"] == "mcp_gateway"
+        activity = _gateway_events(db, "tool_result")
+        assert activity[0].payload_json["toolId"] == "demo_echo"
+
+
+def test_unbound_tool_hidden_from_list_and_blocked() -> None:
+    with _make_db() as db:
+        _seed(db)
+        # agent_codex 未绑定 other.tool
+        db.add(
+            Tool(
+                id="tool_other",
+                tenant_id="tenant_demo",
+                name="other.tool",
+                display_name="未绑定工具",
+                tool_type="mcp",
+                method="POST",
+                url="",
+                mcp_server_id="mcp_builtin",
+                config_json={"tool": "echo"},
+                input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
+            )
+        )
+        db.commit()
+        client = _make_client(db)
+
+        listed = client.post(f"/api/mcp/{_token()}", json=_rpc("tools/list"))
+        names = {tool["name"] for tool in listed.json()["result"]["tools"]}
+        assert "other_tool" not in names
+
+        response = client.post(
+            f"/api/mcp/{_token()}",
+            json=_rpc("tools/call", {"name": "other_tool", "arguments": {"text": "x"}}),
+        )
+        assert response.json()["error"]["code"] == -32602  # unknown tool -> INVALID_PARAMS
+
+
+def test_http_tool_appears_in_list_with_schema() -> None:
+    with _make_db() as db:
+        _seed(db)
+        db.add(
+            Tool(
+                id="tool_http",
+                tenant_id="tenant_demo",
+                name="crm.lookup",
+                display_name="客户查询",
+                tool_type="http",
+                method="GET",
+                url="https://example.test/api",
+                input_schema={
+                    "type": "object",
+                    "properties": {"customer_id": {"type": "string"}},
+                    "required": ["customer_id"],
+                },
+            )
+        )
+        db.add(
+            AgentResourceBinding(
+                id=new_id("agentres"),
+                tenant_id="tenant_demo",
+                agent_id="agent_codex",
+                resource_type="tool",
+                resource_id="tool_http",
+                status="active",
+                metadata_json=agent_private_metadata("agent_codex"),
+            )
+        )
+        db.commit()
+        client = _make_client(db)
+        listed = client.post(f"/api/mcp/{_token()}", json=_rpc("tools/list"))
+        tools = {tool["name"]: tool for tool in listed.json()["result"]["tools"]}
+        assert "crm_lookup" in tools
+        assert tools["crm_lookup"]["inputSchema"]["properties"]["customer_id"]["type"] == "string"

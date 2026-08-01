@@ -81,7 +81,7 @@ async def mcp_endpoint(
     if method == "ping":
         return _jsonrpc_result(request_id, {})
     if method == "tools/list":
-        return _jsonrpc_result(request_id, {"tools": gateway_tool_descriptors()})
+        return _jsonrpc_result(request_id, {"tools": gateway_tool_descriptors(db, grant)})
     if method == "tools/call":
         name = str(params.get("name") or "")
         arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
