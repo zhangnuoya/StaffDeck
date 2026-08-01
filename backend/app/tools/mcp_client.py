@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import selectors
+import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Mapping
 from contextlib import suppress
@@ -185,6 +188,8 @@ class _StdioSession(_MCPSession):
         super().__init__(config, timeout_seconds)
         self._proc: subprocess.Popen[str] | None = None
         self._next_id = 0
+        # Windows 的 selectors 只支持套接字，无法监听管道；改用线程+队列读 stdout。
+        self._lines: queue.Queue[str | None] | None = None
 
     def __enter__(self) -> "_StdioSession":
         command = _stdio_command(self.config)
@@ -203,6 +208,9 @@ class _StdioSession(_MCPSession):
             text=True,
             bufsize=1,
         )
+        if os.name == "nt":
+            self._lines = queue.Queue()
+            threading.Thread(target=self._pump_stdout, daemon=True).start()
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -210,18 +218,51 @@ class _StdioSession(_MCPSession):
             _close_process(self._proc)
             self._proc = None
 
+    def _pump_stdout(self) -> None:
+        proc = self._require_proc()
+        assert proc.stdout is not None
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                if self._lines is not None:
+                    self._lines.put(line)
+        finally:
+            if self._lines is not None:
+                self._lines.put(None)
+
     def _request(self, method: str, params: dict[str, Any]) -> Any:
         proc = self._require_proc()
         self._next_id += 1
         request_id = self._next_id
         _send_json(proc, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-        response = _read_response(proc, expected_id=request_id, timeout_seconds=self.timeout_seconds)
+        response = self._read_response(proc, expected_id=request_id)
         _raise_json_rpc_error(response)
         return response.get("result")
 
     def _notify(self, method: str, params: dict[str, Any]) -> None:
         proc = self._require_proc()
         _send_json(proc, {"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _read_response(self, proc: subprocess.Popen[str], expected_id: int) -> dict[str, Any]:
+        if self._lines is None:
+            return _read_response(proc, expected_id, self.timeout_seconds)
+        deadline = time.monotonic() + max(self.timeout_seconds, 0.1)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MCPClientError(f"MCP stdio 等待响应超时：id={expected_id}")
+            try:
+                line = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                raise MCPClientError(f"MCP stdio 等待响应超时：id={expected_id}") from None
+            if line is None or not line:
+                stderr = _read_stderr(proc)
+                raise MCPClientError(f"MCP stdio server 提前退出。{stderr}".strip())
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("id") == expected_id:
+                return payload
 
     def _require_proc(self) -> subprocess.Popen[str]:
         if self._proc is None:
@@ -240,7 +281,22 @@ def _stdio_command(config: dict[str, Any]) -> list[str]:
         raise MCPClientError("stdio MCP 连接缺少 command。")
     if not isinstance(args, list):
         raise MCPClientError("stdio MCP 连接的 args 必须是数组。")
-    return [*parts, *[str(arg) for arg in args]]
+    return _resolve_stdio_launch([*parts, *[str(arg) for arg in args]])
+
+
+def _resolve_stdio_launch(parts: list[str]) -> list[str]:
+    """Windows 无法直接 CreateProcess 批处理 shim（npx/uvx 等 .cmd/.bat），经 cmd 中转。"""
+    if os.name != "nt" or not parts:
+        return parts
+    executable = parts[0]
+    if executable.lower().endswith((".cmd", ".bat")):
+        resolved = shutil.which(executable) or executable
+    else:
+        resolved_which = shutil.which(executable)
+        if not resolved_which or not resolved_which.lower().endswith((".cmd", ".bat")):
+            return parts
+        resolved = resolved_which
+    return ["cmd", "/c", resolved, *parts[1:]]
 
 
 # --------------------------------------------------------------------------- #
