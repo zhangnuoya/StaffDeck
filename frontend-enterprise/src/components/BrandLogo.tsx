@@ -22,7 +22,7 @@ export default function BrandLogo({
     <span className={cn('flex items-center gap-[8px] overflow-hidden p-[4px]', className)}>
       <img
         src={logoMark}
-        alt="数字员工"
+        alt="XWorker"
         className="shrink-0"
         style={{ width: markSize, height: markSize }}
       />
@@ -32,7 +32,7 @@ export default function BrandLogo({
             OpenBMB
           </span> */}
           <strong className="text-[17px] font-semibold leading-none text-[#18181a]">
-            数字员工
+            XWorker
           </strong>
         </span>
       )}
