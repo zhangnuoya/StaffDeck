@@ -50,3 +50,5 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 packaging/assets/staffdeck.iconset/
+# 容器 codex 工作区数据目录（bind mount 源，运行时数据，不进 git）
+/workspace/
