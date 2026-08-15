@@ -181,6 +181,8 @@ def test_initialize_and_tools_list() -> None:
         # seed 中 agent_codex 未绑定任何知识库：query_knowledge 描述同样不含清单
         kb_tool = next(tool for tool in tools if tool["name"] == "query_knowledge")
         assert "Available knowledge bases" not in kb_tool["description"]
+        # 定向参数随 schema 暴露给外部运行时
+        assert "knowledge_base" in kb_tool["inputSchema"]["properties"]
 
         unknown = client.post(f"/api/mcp/{token}", json=_rpc("resources/list"))
         assert unknown.json()["error"]["code"] == -32601
@@ -370,6 +372,86 @@ def test_query_knowledge_description_lists_bound_knowledge_bases() -> None:
         other_tools = other.json()["result"]["tools"]
         other_kb = next(tool for tool in other_tools if tool["name"] == "query_knowledge")
         assert "Available knowledge bases" not in other_kb["description"]
+
+
+def test_query_knowledge_respects_knowledge_base_filter(monkeypatch) -> None:
+    """knowledge_base 参数把检索限定到指定库；未知名称报错并回显可用清单。"""
+    with _make_db() as db:
+        _seed(db)
+        db.add(KnowledgeBase(id="kb_ops", tenant_id="tenant_demo", name="运维手册"))
+        for kb_id in ("kb_policy", "kb_ops"):
+            db.add(
+                AgentKnowledgeBranch(
+                    id=new_id("agentkb"),
+                    tenant_id="tenant_demo",
+                    agent_id="agent_codex",
+                    knowledge_base_id=kb_id,
+                )
+            )
+            db.add(
+                AgentResourceBinding(
+                    id=new_id("agentres"),
+                    tenant_id="tenant_demo",
+                    agent_id="agent_codex",
+                    resource_type="knowledge_base",
+                    resource_id=kb_id,
+                    status="active",
+                    metadata_json=agent_private_metadata("agent_codex"),
+                )
+            )
+        db.commit()
+        client = _make_client(db)
+
+        import app.mcp_gateway.tools as gateway_tools
+        from app.knowledge.schema import KnowledgeSearchResponse
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_search(self, request, model_config=None):
+            captured["ids"] = list(request.knowledge_base_ids)
+            return KnowledgeSearchResponse()
+
+        monkeypatch.setattr(gateway_tools.KnowledgeService, "search", fake_search)
+
+        targeted = client.post(
+            f"/api/mcp/{_token()}",
+            json=_rpc(
+                "tools/call",
+                {
+                    "name": "query_knowledge",
+                    "arguments": {"query": "报销流程", "knowledge_base": "制度库"},
+                },
+            ),
+        )
+        assert targeted.json()["result"]["isError"] is False
+        assert captured["ids"] == ["kb_policy"]
+
+        unknown = client.post(
+            f"/api/mcp/{_token()}",
+            json=_rpc(
+                "tools/call",
+                {
+                    "name": "query_knowledge",
+                    "arguments": {"query": "报销流程", "knowledge_base": "不存在的库"},
+                },
+            ),
+        )
+        payload = unknown.json()["result"]
+        assert payload["isError"] is True
+        assert "可用知识库" in payload["content"][0]["text"]
+        assert "制度库" in payload["content"][0]["text"]
+        assert "运维手册" in payload["content"][0]["text"]
+        assert captured["ids"] == ["kb_policy"]  # 未知名称不应触发检索
+
+        all_bases = client.post(
+            f"/api/mcp/{_token()}",
+            json=_rpc(
+                "tools/call",
+                {"name": "query_knowledge", "arguments": {"query": "报销流程"}},
+            ),
+        )
+        assert all_bases.json()["result"]["isError"] is False
+        assert sorted(captured["ids"]) == ["kb_ops", "kb_policy"]
 
 
 def test_unknown_gateway_tool_is_a_jsonrpc_error() -> None:

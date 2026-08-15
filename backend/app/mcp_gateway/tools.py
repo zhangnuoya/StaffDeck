@@ -62,6 +62,13 @@ def _builtin_tool_descriptors(
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "What to look up"},
+                    "knowledge_base": {
+                        "type": "string",
+                        "description": (
+                            "Optional knowledge base name to restrict the search to "
+                            "(pick from the Available knowledge bases list); omit to search all."
+                        ),
+                    },
                     "max_chunks": {
                         "type": "integer",
                         "description": "Maximum chunks to return (1-8, default 6)",
@@ -323,6 +330,26 @@ def _query_knowledge(db: Session, grant: CapabilityGrant, arguments: dict[str, A
     knowledge_base_ids = visible_knowledge_base_ids(db, grant.tenant_id, grant.agent_id)
     if not knowledge_base_ids:
         return _error_result("query_knowledge", "NOT_ALLOWED", "当前员工未绑定任何知识库")
+    kb_filter = str(arguments.get("knowledge_base") or "").strip()
+    if kb_filter:
+        # 定向检索：按名称精确匹配员工可见知识库（名称有租户级唯一约束），
+        # 匹配不到时报错并回显可用清单，帮助外部模型纠正。
+        visible_rows = db.exec(
+            select(KnowledgeBase).where(
+                KnowledgeBase.tenant_id == grant.tenant_id,
+                KnowledgeBase.id.in_(knowledge_base_ids),
+            )
+        ).all()
+        matched = next((kb for kb in visible_rows if kb.name == kb_filter), None)
+        if matched is None:
+            names = sorted(kb.name for kb in visible_rows if kb.name)
+            listing = "、".join(names) if names else "(无)"
+            return _error_result(
+                "query_knowledge",
+                "INVALID_ARGUMENTS",
+                f"知识库「{kb_filter}」不存在或当前员工未绑定。可用知识库：{listing}。",
+            )
+        knowledge_base_ids = [matched.id]
     try:
         max_chunks = int(arguments.get("max_chunks") or 6)
     except (TypeError, ValueError):
