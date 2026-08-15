@@ -169,9 +169,10 @@ def test_overall_agent_must_use_native_runtime() -> None:
         assert exc.value.status_code == 409
 
 
-def test_gallery_published_agent_must_use_native_runtime() -> None:
+def test_gallery_published_agent_rejected_when_cli_unavailable(monkeypatch) -> None:
     with _test_session() as db:
         owner, _admin = _seed_users(db)
+        monkeypatch.setattr("app.runtimes.adapters.codex.codex_cli_available", lambda: False)
         with pytest.raises(HTTPException) as exc:
             create_agent(
                 AgentProfileCreateRequest(
@@ -187,7 +188,27 @@ def test_gallery_published_agent_must_use_native_runtime() -> None:
         assert exc.value.status_code == 409
 
 
-def test_update_agent_switches_runtime_and_validates_resulting_state() -> None:
+def test_gallery_published_agent_allowed_when_cli_available(monkeypatch) -> None:
+    with _test_session() as db:
+        owner, _admin = _seed_users(db)
+        monkeypatch.setattr("app.runtimes.adapters.codex.codex_cli_available", lambda: True)
+        created = create_agent(
+            AgentProfileCreateRequest(
+                tenant_id="tenant_demo",
+                name="广场编码员工",
+                source_mode="blank",
+                runtime=AgentRuntimeKind.CODEX,
+                metadata={"published_to_gallery": True},
+            ),
+            db=db,
+            current_user=owner,
+        )
+        assert created.runtime == "codex"
+        assert created.metadata.get("published_to_gallery") is True
+
+
+def test_update_agent_switches_runtime_and_validates_resulting_state(monkeypatch) -> None:
+    monkeypatch.setattr("app.runtimes.adapters.codex.codex_cli_available", lambda: False)
     with _test_session() as db:
         owner, _admin = _seed_users(db)
         created = create_agent(
@@ -212,7 +233,7 @@ def test_update_agent_switches_runtime_and_validates_resulting_state() -> None:
         assert updated.runtime == "codex"
         assert updated.runtime_config == {"model": "gpt-5-codex"}
 
-        # 已切到 codex 后再发布到广场 → 409（运行时不在本次请求中也按结果态校验）
+        # 已切到 codex 后再发布到广场：CLI 不可用 → 409（运行时不在本次请求中也按结果态校验）
         with pytest.raises(HTTPException) as exc:
             update_agent(
                 created.id,
@@ -225,7 +246,7 @@ def test_update_agent_switches_runtime_and_validates_resulting_state() -> None:
             )
         assert exc.value.status_code == 409
 
-        # 已发布员工（先切回 native 并发布）再切 codex → 409
+        # 已发布员工（先切回 native 并发布）再切 codex：CLI 不可用 → 409
         update_agent(
             created.id,
             AgentProfileUpdateRequest(
@@ -247,6 +268,54 @@ def test_update_agent_switches_runtime_and_validates_resulting_state() -> None:
                 current_user=owner,
             )
         assert exc.value.status_code == 409
+
+
+def test_update_agent_can_publish_codex_when_cli_available(monkeypatch) -> None:
+    monkeypatch.setattr("app.runtimes.adapters.codex.codex_cli_available", lambda: True)
+    with _test_session() as db:
+        owner, _admin = _seed_users(db)
+        created = create_agent(
+            AgentProfileCreateRequest(
+                tenant_id="tenant_demo",
+                name="发布编码员工",
+                source_mode="blank",
+            ),
+            db=db,
+            current_user=owner,
+        )
+        update_agent(
+            created.id,
+            AgentProfileUpdateRequest(
+                tenant_id="tenant_demo",
+                runtime=AgentRuntimeKind.CODEX,
+                metadata={"published_to_gallery": True},
+            ),
+            db=db,
+            current_user=owner,
+        )
+        # 已发布状态下再切回 codex（已在 codex）不冲突；切 native 再切回也放行
+        updated = update_agent(
+            created.id,
+            AgentProfileUpdateRequest(
+                tenant_id="tenant_demo",
+                runtime=AgentRuntimeKind.NATIVE,
+            ),
+            db=db,
+            current_user=owner,
+        )
+        assert updated.runtime == "native"
+        assert updated.metadata.get("published_to_gallery") is True
+        updated = update_agent(
+            created.id,
+            AgentProfileUpdateRequest(
+                tenant_id="tenant_demo",
+                runtime=AgentRuntimeKind.CODEX,
+            ),
+            db=db,
+            current_user=owner,
+        )
+        assert updated.runtime == "codex"
+        assert updated.metadata.get("published_to_gallery") is True
 
 
 # ---------------------------------------------------------------------------

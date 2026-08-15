@@ -2162,7 +2162,7 @@
   "成员": "Member",
   "运行引擎": "Runtime Engine",
   "原生引擎": "Native Engine",
-  "场景技能仅原生引擎可用；Codex 运行时由本机 Codex CLI 执行，具备编码与长任务能力。该员工不能发布到广场。": "Scene skills are only available on the native engine. The Codex runtime runs on your local Codex CLI with coding and long-task capabilities. This agent cannot be published to the marketplace.",
+  "Codex 员工发布后，使用者需具备可用的 Codex CLI 环境。": "Published Codex employees require an available Codex CLI environment for the people using them.",
   "模型覆盖": "Model Override",
   "留空则跟随「模型」页的默认模型": "Leave empty to follow the default model on the Models page",
   "能力范围": "Capability Scope",

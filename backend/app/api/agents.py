@@ -1003,11 +1003,29 @@ def agent_read(
 
 
 def _ensure_runtime_gallery_compatible(runtime: AgentRuntimeKind, metadata: dict) -> None:
-    if runtime != AgentRuntimeKind.NATIVE and (metadata or {}).get("published_to_gallery") is True:
+    if runtime == AgentRuntimeKind.NATIVE or (metadata or {}).get("published_to_gallery") is not True:
+        return
+    if not _runtime_available_in_deployment(runtime):
         raise HTTPException(
             status_code=409,
-            detail="Gallery-published agents must use the native runtime",
+            detail="Gallery-published agents require a runtime available in this deployment",
         )
+
+
+def _runtime_available_in_deployment(runtime: AgentRuntimeKind) -> bool:
+    """发布到广场要求执行环境可移植：非原生运行时必须在本部署中真实可用。
+
+    与 runtimes.registry.create_runtime 的聊天期判定一致，惰性 import 防循环依赖。
+    """
+    if runtime == AgentRuntimeKind.CODEX:
+        from app.runtimes.adapters.codex import codex_cli_available
+
+        return codex_cli_available()
+    if runtime == AgentRuntimeKind.CLAUDE_CODE:
+        from app.runtimes.adapters.claude_code import claude_cli_available
+
+        return claude_cli_available()
+    return True
 
 
 def _is_database_locked_error(exc: OperationalError) -> bool:

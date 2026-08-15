@@ -27,6 +27,7 @@ import UpdateReminder from "./components/UpdateReminder";
 import StaffdeckIcon from "./components/StaffdeckIcon";
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { EnterpriseRoute } from "./enums/routes";
+import { AgentRuntime, parseAgentRuntime } from "./enums/agent-runtime";
 import {
   employeeBlankMetadata,
   canAccessEmployeeAgent,
@@ -391,7 +392,19 @@ function Shell({
       ? sourceAgents.find((item) => item.id === agentForm.copyFromAgentId)
       : undefined;
     const sourceMetadata =
-      !isBlankOnboarding && sourceAgent?.metadata ? sourceAgent.metadata : {};
+      !isBlankOnboarding && sourceAgent?.metadata
+        ? { ...sourceAgent.metadata }
+        : {};
+    if (!isBlankOnboarding) {
+      // 复制品默认不发布：广场字段归属创建者本人，剥离源员工的发布状态
+      delete sourceMetadata.published_to_gallery;
+      delete sourceMetadata.gallery_published_at;
+      delete sourceMetadata.gallery_published_by;
+    }
+    const copyRuntime =
+      !isBlankOnboarding && sourceAgent
+        ? parseAgentRuntime(sourceAgent.runtime)
+        : AgentRuntime.Native;
     const sourceRoleName =
       sourceAgent && !sourceAgent.is_overall
         ? employeeProfile(sourceAgent).roleName
@@ -435,6 +448,9 @@ function Shell({
             agentForm.sourceMode === "copy"
               ? agentForm.copyFromAgentId || undefined
               : undefined,
+          runtime: copyRuntime,
+          runtime_config:
+            !isBlankOnboarding && sourceAgent ? sourceAgent.runtime_config || {} : {},
           metadata: isBlankOnboarding
             ? employeeBlankMetadata(baseMetadata)
             : baseMetadata,

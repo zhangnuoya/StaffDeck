@@ -209,7 +209,6 @@ export default function EmployeeProfileEditor({
                     onValueChange={(value) =>
                       update({
                         runtime: parseAgentRuntime(value),
-                        ...(value === AgentRuntime.Codex ? { publishedToGallery: false } : {}),
                       })
                     }
                   >
@@ -234,7 +233,7 @@ export default function EmployeeProfileEditor({
               </div>
               {form.runtime === AgentRuntime.Codex && (
                 <p className="m-0 text-[12px] leading-relaxed text-muted-foreground">
-                  场景技能仅原生引擎可用；Codex 运行时由本机 Codex CLI 执行，具备编码与长任务能力。该员工不能发布到广场。
+                  Codex 员工发布后，使用者需具备可用的 Codex CLI 环境。
                 </p>
               )}
 
@@ -294,7 +293,6 @@ export default function EmployeeProfileEditor({
                 </div>
                 <Switch
                   checked={form.publishedToGallery}
-                  disabled={form.runtime !== AgentRuntime.Native}
                   onCheckedChange={(next) => update({ publishedToGallery: next })}
                 />
               </div>
