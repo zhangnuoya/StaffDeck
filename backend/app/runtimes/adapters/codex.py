@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,10 @@ from app.core.agent_identity_prompt import AgentIdentityPrompt
 from app.core.cancellation import clear_chat_turn_cancelled, is_chat_turn_cancelled
 from app.core.legacy_conversation_projection import LegacyConversationProjection
 from app.db.models import AgentProfile, ChatSession, Message, utc_now
+from app.knowledge.citations import (
+    compact_knowledge_citation_labels,
+    knowledge_citations_from_results,
+)
 from app.mcp_gateway import issue_capability_token
 from app.observability.event_log import EventLog
 from app.runtimes import bookkeeping
@@ -36,6 +40,17 @@ logger = logging.getLogger(__name__)
 _HEARTBEAT_SECONDS = 15.0
 _HISTORY_MESSAGE_LIMIT = 10
 _CODEX_PROGRESS_PHASE = "codex_progress"
+
+# 沙箱等级白名单 + 宿主默认值。单容器/服务器（Linux）默认 workspace-write：
+# landlock 把写限制在会话目录内——物理挡住 ~/.codex 用户级 MCP/skill 配置写入
+# 与跨会话目录写（多员工共用一个 codex home，见 docker/entrypoint-codex.sh）。
+# Windows 宿主默认 bypass：codex 的 Windows 沙箱会拦 pwsh，无终端场景不可用。
+# runtime_config.sandbox 显式配置优先。
+# 注意：Linux 下不要用 --approve-for-me 做写隔离——实测 codex 0.147.0 的
+# 「自动批准」对越界写命令是批准后在沙箱外执行（写 workspace 根/其他 session
+# 目录均成功），必须显式 -s workspace-write 才由 landlock 真实拦截（Read-only）。
+_ALLOWED_SANDBOX_MODES = {"bypass", "workspace-write", "read-only", "danger-full-access"}
+_DEFAULT_SANDBOX = "bypass" if os.name == "nt" else "workspace-write"
 
 _CODEX_CLI_NOT_FOUND = "未找到 Codex CLI。请先安装 codex-cli 或在设置中配置 codex_cli_path。"
 
@@ -55,6 +70,10 @@ class _PreparedTurn:
     usage: dict[str, Any] | None = None
     failed: bool = False
     response: ChatTurnResponse | None = None
+    # 本轮 staffdeck.query_knowledge 调用返回的结构化证据
+    # （MCP structuredContent，与原生引擎 response_items 同构），
+    # _finalize 时据此生成回复引用的 knowledge_citations。
+    knowledge_results: list[dict[str, Any]] = field(default_factory=list)
 
 
 class CodexAgentRuntime:
@@ -178,6 +197,11 @@ class CodexAgentRuntime:
             "业务工具已按原生名称在工具清单中列出，请直接按名调用（不要用 call_tool 包装）；"
             "知识库检索用 query_knowledge，通用技能用 run_general_skill。不要编造企业内部信息。"
         )
+        sections.append(
+            "query_knowledge 返回的片段是临时证据：回答必须基于这些内容，"
+            "引用来源时使用片段对应的 [n] 编号标注（例如「根据 [1]」）；"
+            "证据不足时不得编造企业政策、流程或文档事实，可再次调用 query_knowledge 补充检索。"
+        )
         history = self._history_text(chat_session, user_message_id)
         if history:
             sections.append(f"[对话历史]\n{history}")
@@ -230,6 +254,20 @@ class CodexAgentRuntime:
                 pass  # 模型未验证等：回退全局配置
         return str(self._settings.codex_default_model or "").strip()
 
+    def _resolve_sandbox(self, prepared: _PreparedTurn) -> str:
+        """沙箱等级：runtime_config.sandbox 显式配置优先，否则按宿主平台默认。
+
+        默认 workspace-write（Linux/容器）意味着写被 landlock 限制在会话目录内，
+        用户级 ~/.codex 配置（MCP/skill）与其他员工的会话目录都无法被写入，
+        员工只能在项目级（自己的 .codex 工作空间配置）安装能力。
+        """
+        configured = str(prepared.runtime_config.get("sandbox") or "").strip()
+        if configured in _ALLOWED_SANDBOX_MODES:
+            return configured
+        if configured:
+            logger.warning("忽略未知 sandbox 模式 %r，回退默认 %s", configured, _DEFAULT_SANDBOX)
+        return _DEFAULT_SANDBOX
+
     def _build_args(self, prepared: _PreparedTurn) -> list[str]:
         args = [*_codex_base_command(self._settings), "exec"]
         if prepared.is_resume:
@@ -237,16 +275,19 @@ class CodexAgentRuntime:
         args += ["-", "--json", "--skip-git-repo-check"]
         if not prepared.is_resume:
             args += ["-C", str(prepared.workspace)]
-        sandbox = str(prepared.runtime_config.get("sandbox") or "bypass")
+        sandbox = self._resolve_sandbox(prepared)
         if sandbox == "bypass":
-            # 非交互服务场景无人能点“批准”；审批层（approval_policy=never）会
-            # 把 MCP 工具调用自动取消，且 Windows 沙箱会拦截 pwsh。默认完全绕过
-            # 审批与沙箱（与 claude_code 适配器的 bypassPermissions 同一姿态），
-            # 收紧环境可用 runtime_config.sandbox = workspace-write / read-only 回退。
+            # 显式 bypass（或 Windows 默认）：完全关闭审批与沙箱。
             args += ["--dangerously-bypass-approvals-and-sandbox"]
         elif prepared.is_resume:
+            # resume 不接受审批/沙箱 flag（随 thread 持久化），仅 -c 覆盖沙箱模式。
             args += ["-c", f'sandbox_mode="{sandbox}"']
         else:
+            # 显式 -s 沙箱模式（不带审批 flag）：headless 下命令直接执行、不被取消，
+            # 越界写由 landlock 真实拦截为 Read-only file system。
+            # 不用 --approve-for-me：其「自动批准」会让越界写命令脱离沙箱执行
+            # （批准即放行），实测写 workspace 根/其他 session 目录均成功，
+            # 写隔离名存实亡（codex 0.147.0，2026-08-15 容器实测）。
             args += ["-s", sandbox]
         model = self._resolve_model(prepared)
         if model:
@@ -259,6 +300,12 @@ class CodexAgentRuntime:
         )
         gateway_url = f"{self._settings.normalized_tool_base_url}/api/mcp/{token}"
         args += ["-c", f'mcp_servers.staffdeck.url="{gateway_url}"']
+        # staffdeck MCP 工具按 per-server 审批默认值自动放行：无终端下无人审批
+        # 会取消 MCP 工具调用（resume 实测），approve 保证业务工具可用，
+        # 能力过滤仍由 gateway 的 capability token 按员工兜底。非 staffdeck 的
+        # MCP server（如用户级安装的）不受此配置影响，在沙箱模式下其工具调用
+        # 仍会被取消——顺带废掉绕过文件锁装入的用户级 MCP 的可用性。
+        args += ["-c", 'mcp_servers.staffdeck.default_tools_approval_mode="approve"']
         return args
 
     # ------------------------------------------------------------------
@@ -310,6 +357,9 @@ class CodexAgentRuntime:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                # Linux 下新会话独立进程组：取消/超时经 killpg 清理整个包装链
+                # （如单容器双用户分离的 sudo -u appuser codex）。
+                start_new_session=(os.name != "nt"),
             )
         except FileNotFoundError:
             yield from self._fail_turn(
@@ -407,6 +457,13 @@ class CodexAgentRuntime:
                     "mcp_tool_call",
                     "web_search",
                 }:
+                    if item_type == "mcp_tool_call":
+                        self._collect_knowledge_item(prepared, item)
+                        # staffdeck MCP 调用由网关侧审计记录 tool_result（execute_gateway_tool），
+                        # 不再转发 codex 转录的成功调用，避免同一次调用在界面显示两张工具卡片；
+                        # 失败调用（JSON-RPC 级错误）网关不落审计事件，仍需转录兜底展示。
+                        if str(item.get("server") or "") == "staffdeck" and not item.get("error"):
+                            continue
                     yield self._event(
                         prepared,
                         "tool_result",
@@ -467,6 +524,20 @@ class CodexAgentRuntime:
     # turn outcomes
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _collect_knowledge_item(prepared: _PreparedTurn, item: dict[str, Any]) -> None:
+        """提取 staffdeck.query_knowledge 调用的结构化证据包供回复引用。"""
+        if str(item.get("server") or "") != "staffdeck":
+            return
+        if str(item.get("tool") or "") != "query_knowledge":
+            return
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        structured = result.get("structured_content") or result.get("structuredContent")
+        if isinstance(structured, dict) and (
+            structured.get("evidence_pack") or structured.get("chunks")
+        ):
+            prepared.knowledge_results.append(structured)
+
     def _finalize(self, prepared: _PreparedTurn, cancelled: bool = False) -> None:
         session = prepared.chat_session
         state = dict(prepared.runtime_state)
@@ -482,6 +553,16 @@ class CodexAgentRuntime:
             extra_metadata["codex_thread_id"] = state["thread_id"]
         if cancelled:
             extra_metadata["status"] = "cancelled"
+        # 知识引用：与原生引擎同构——从结构化证据包提取引用、按回复文本中
+        # [n] 首次出现顺序重编号，写入消息 metadata 供前端渲染引用卡片。
+        if prepared.knowledge_results and not cancelled:
+            citations = knowledge_citations_from_results(prepared.knowledge_results)
+            if citations:
+                compacted_reply, compacted = compact_knowledge_citation_labels(
+                    prepared.reply, citations
+                )
+                prepared.reply = compacted_reply
+                extra_metadata["knowledge_citations"] = compacted
         bookkeeping.finalize_simple_turn(
             self._db,
             self._events,

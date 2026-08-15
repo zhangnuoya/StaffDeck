@@ -9,6 +9,8 @@ Scenario selection via FAKE_CODEX_SCENARIO:
 - "no_message": completes without any agent_message
 - "fail": emits an error event and exits non-zero
 - "slow": sleeps FAKE_CODEX_SLOW_SECONDS before answering (timeout/cancel tests)
+- "mcp_tool_success": staffdeck MCP tool call that succeeds
+- "mcp_tool_error": staffdeck MCP tool call that fails at the JSON-RPC level
 """
 
 from __future__ import annotations
@@ -43,6 +45,145 @@ def main() -> int:
     if scenario == "fail":
         _emit({"type": "error", "message": "simulated codex failure"})
         return 1
+
+    if scenario == "knowledge_citation":
+        _emit(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_k",
+                    "type": "mcp_tool_call",
+                    "server": "staffdeck",
+                    "tool": "query_knowledge",
+                    "arguments": {"query": "考勤制度"},
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "[1] 迟到超过30分钟按旷工半天处理。\n\n[2] 请假需提前一天在系统申请。",
+                            }
+                        ],
+                        "structured_content": {
+                            "query": "考勤制度",
+                            "chunks": [],
+                            "selected_documents": [],
+                            "selected_concepts": [],
+                            "okf_citations": [],
+                            "evidence_pack": [
+                                {
+                                    "chunk_id": "c1",
+                                    "document_id": "d1",
+                                    "bucket_id": "b1",
+                                    "source_path": "docs/考勤制度.md",
+                                    "section_path": "考勤制度 > 迟到早退",
+                                    "summary": "迟到早退规定",
+                                    "content": "迟到超过30分钟按旷工半天处理。",
+                                    "excerpt": "迟到超过30分钟按旷工半天处理。",
+                                    "relevance_score": 0.9,
+                                    "confidence_reason": "引用来源摘要、章节路径或正文与查询相关",
+                                },
+                                {
+                                    "chunk_id": "c2",
+                                    "document_id": "d1",
+                                    "bucket_id": "b1",
+                                    "source_path": "docs/考勤制度.md",
+                                    "section_path": "考勤制度 > 请假流程",
+                                    "summary": "请假流程",
+                                    "content": "请假需提前一天在系统申请。",
+                                    "excerpt": "请假需提前一天在系统申请。",
+                                    "relevance_score": 0.85,
+                                    "confidence_reason": "引用来源摘要、章节路径或正文与查询相关",
+                                },
+                            ],
+                            "trace": [],
+                        },
+                    },
+                },
+            }
+        )
+        _emit(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_k2",
+                    "type": "agent_message",
+                    "text": "根据 [2] 请假需提前一天在系统申请；[1] 提到迟到超过30分钟按旷工半天处理。",
+                },
+            }
+        )
+        _emit(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 5},
+            }
+        )
+        return 0
+
+    if scenario == "mcp_tool_success":
+        _emit(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_m",
+                    "type": "mcp_tool_call",
+                    "server": "staffdeck",
+                    "tool": "mysql_mysql_query",
+                    "arguments": {"sql": "select 3"},
+                    "result": {
+                        "content": [{"type": "text", "text": "[[3]]"}],
+                    },
+                },
+            }
+        )
+        _emit(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_m2",
+                    "type": "agent_message",
+                    "text": "查询结果为 3。",
+                },
+            }
+        )
+        _emit(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 5},
+            }
+        )
+        return 0
+
+    if scenario == "mcp_tool_error":
+        _emit(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_me",
+                    "type": "mcp_tool_call",
+                    "server": "staffdeck",
+                    "tool": "unknown_tool",
+                    "arguments": {},
+                    "error": "unknown tool: unknown_tool",
+                },
+            }
+        )
+        _emit(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_me2",
+                    "type": "agent_message",
+                    "text": "工具调用失败，请检查工具名。",
+                },
+            }
+        )
+        _emit(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 5},
+            }
+        )
+        return 0
 
     _emit(
         {

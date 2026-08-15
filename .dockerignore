@@ -1,0 +1,40 @@
+# Docker build context 排除项（context = 仓库根）
+# 注意：不要排除 frontend-enterprise/dist（镜像需要本地构建产物）。
+
+.git
+.gitignore
+
+# Python 本地环境与缓存
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.venv
+backend/.runtime_venv
+backend/*.egg-info
+
+# 运行时数据（不进镜像，走 volume）
+# *.db* 同时覆盖 .db-wal/.db-shm/.db.connector.lock（后者被运行中的 backend 加锁，
+# 若进入 build context 会导致 Docker 读取文件报共享冲突）
+backend/*.db*
+backend/connector-locks
+
+# 密钥与本地配置（绝不进镜像，经 compose env_file/environment 注入）
+backend/.env
+**/.env
+
+# 前端源码与依赖（只需 dist 构建产物）
+frontend-enterprise/node_modules
+frontend-enterprise/src
+frontend-enterprise/public
+frontend-enterprise/scripts
+
+# 打包产物与工具链（大目录）
+packaging/out
+packaging/build
+packaging/runtime_dl
+packaging/toolchain
+tools-vendor/node_modules
+
+# 其他
+*.log
+.dev

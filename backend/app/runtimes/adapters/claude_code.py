@@ -299,6 +299,8 @@ class ClaudeCodeAgentRuntime:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                # Linux 下新会话独立进程组：取消/超时经 killpg 清理整个包装链。
+                start_new_session=(os.name != "nt"),
             )
         except FileNotFoundError:
             yield from self._fail_turn(

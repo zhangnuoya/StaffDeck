@@ -1,0 +1,43 @@
+# XWorker 本地 Docker Desktop 调试 overlay —— 含本地密钥，不要提交 git。
+#
+# 相对 docker-compose.yml（服务器版）的本地差异：
+#   - 宿主 5173 已被占用 → 仅映射 5174:5173（cc-switch 3005 不暴露）
+#   - workspace bind 指向 Windows 本地路径
+#   - 注入本地 APP_SECRET（与旧容器一致）
+#   - 卷名用 name: 固定为 xworker-*（旧容器的手工命名卷），
+#     与 project 名无关，recreate 不丢数据库/登录态
+#
+# 用法（在 docker/ 目录）：
+#   docker compose -p xworker -f docker-compose.yml -f docker-compose.local.yml up -d
+# 升级重建：
+#   docker compose -p xworker -f docker-compose.yml -f docker-compose.local.yml build
+#   docker compose -p xworker -f docker-compose.yml -f docker-compose.local.yml up -d
+
+services:
+  xworker:
+    ports: !override
+      - "5174:5173"
+    volumes: !override
+      - xworker-staffdeck-data:/opt/staffdeck/staffdeck-data
+      - xworker-npx-cache:/home/staffdeck/.npm
+      - xworker-uv-cache:/home/staffdeck/.cache/uv
+      - xworker-codex-home:/home/appuser/.codex
+      - xworker-lark-home:/home/appuser/.lark-channel
+      - xworker-ccswitch-home:/home/appuser/.cc-switch
+      - /run/desktop/mnt/host/e/My_Files/Project/StaffDeck/workspace:/home/appuser/workspace
+    environment:
+      APP_SECRET: "GDS569FG543d65s7898fsdghjytk763ghjgj"
+
+volumes:
+  xworker-staffdeck-data:
+    name: xworker-staffdeck-data
+  xworker-npx-cache:
+    name: xworker-npx-cache
+  xworker-uv-cache:
+    name: xworker-uv-cache
+  xworker-codex-home:
+    name: xworker-codex-home
+  xworker-lark-home:
+    name: xworker-lark-home
+  xworker-ccswitch-home:
+    name: xworker-ccswitch-home

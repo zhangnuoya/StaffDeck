@@ -1,0 +1,29 @@
+# XWorker 开发 overlay（频繁开发用）
+#
+# 用法（在 docker/ 目录下）：
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# 效果：
+#   - backend 源码与前端 dist 从宿主机实时挂载，覆盖镜像内拷贝
+#   - STAFFDECK_RELOAD=1 启用 uvicorn 热重载：改 Python 代码即时生效，无需重建
+#   - 数据库等数据仍在命名卷中，改代码 / 重启容器不碰数据
+#
+# 注意：
+#   - 首次使用先 docker compose build（装依赖层），此后只有 backend 依赖
+#     变更（pyproject.toml / uv.lock）才需要重新 build（依赖层缓存，秒级）
+#   - Windows Docker Desktop 的挂载目录没有 inotify 事件，靠
+#     WATCHFILES_FORCE_POLLING=true 轮询保证热重载可靠
+#   - 前端热更：改前端源码后本地执行 vite build（或 npm run dev 起 vite，
+#     详见 README「开发模式」），dist 挂载后刷新页面即可
+
+services:
+  xworker:
+    volumes:
+      # 源码覆盖镜像内拷贝：改代码即时热重载
+      - ../backend:/opt/staffdeck/backend
+      # 前端构建产物（vite build 后即时生效）
+      - ../frontend-enterprise/dist:/opt/staffdeck/frontend-enterprise/dist
+    environment:
+      STAFFDECK_RELOAD: "1"
+      # Windows Docker Desktop 挂载目录无 inotify 事件，轮询保证热重载可靠
+      WATCHFILES_FORCE_POLLING: "true"

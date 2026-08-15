@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 from collections.abc import Iterator
 from typing import Any
@@ -39,7 +40,9 @@ def kill_process_tree(process: subprocess.Popen) -> None:
                 check=False,
             )
         else:
-            process.kill()
+            # 子进程以 start_new_session 启动：杀整个进程组，
+            # 覆盖包装层（如 sudo -u appuser codex）下的真实 codex 进程。
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
     except (OSError, subprocess.SubprocessError):
         try:
             process.kill()

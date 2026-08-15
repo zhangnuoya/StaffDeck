@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -18,7 +19,12 @@ from app.runtimes import (
     create_runtime,
     resolve_runtime_for_request,
 )
-from app.runtimes.adapters.codex import CodexAgentRuntime, codex_cli_available
+from app.runtimes.adapters import codex as codex_mod
+from app.runtimes.adapters.codex import (
+    _PreparedTurn,
+    CodexAgentRuntime,
+    codex_cli_available,
+)
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 
 FAKE_CLI = str(Path(__file__).resolve().parents[1] / "mock_servers" / "fake_codex_cli.py")
@@ -130,8 +136,15 @@ def test_handle_turn_end_to_end_with_fake_cli(codex_settings, tmp_path) -> None:
         argv_text = " ".join(capture["argv"])
         assert "exec" in capture["argv"]
         assert "--json" in capture["argv"]
-        # 默认完全绕过审批与沙箱（runtime_config.sandbox 可回退 workspace-write）
-        assert "--dangerously-bypass-approvals-and-sandbox" in capture["argv"]
+        # 沙箱默认值跟随宿主平台：Linux/容器=workspace-write（-s 显式沙箱，
+        # 不用 --approve-for-me——其自动批准会让越界写脱离沙箱执行），
+        # Windows=bypass（完全绕过）。显式 runtime_config.sandbox 可覆盖。
+        if codex_mod._DEFAULT_SANDBOX == "bypass":
+            assert "--dangerously-bypass-approvals-and-sandbox" in capture["argv"]
+        else:
+            assert "-s" in capture["argv"]
+            assert "workspace-write" in capture["argv"]
+            assert "--approve-for-me" not in capture["argv"]
         assert "resume" not in capture["argv"]
         assert "fake-codex-model" in argv_text
         assert "staffdeck" in capture["prompt"] or "企业知识库" in capture["prompt"]
@@ -335,3 +348,179 @@ def test_runtime_config_model_overrides_default(codex_settings, monkeypatch) -> 
         capture = _json.loads(capture_path.read_text(encoding="utf-8"))
         idx = capture["argv"].index("-m")
         assert capture["argv"][idx + 1] == "fake-codex-model"
+
+
+# ---------------------------------------------------------------------------
+# sandbox 参数矩阵（不跑 CLI，直测 _build_args）
+# ---------------------------------------------------------------------------
+
+
+def _prepared(*, runtime_config=None, is_resume: bool = False) -> _PreparedTurn:
+    """构造 _build_args 所需的最小 _PreparedTurn（不落库、不跑 CLI）。"""
+    return _PreparedTurn(
+        request=ChatTurnRequest(tenant_id="tenant_demo", agent_id="agent_codex", message="hi"),
+        chat_session=ChatSession(id="session_x", tenant_id="tenant_demo", agent_id="agent_codex"),
+        user_message_id="msg_1",
+        agent=None,
+        runtime_config=runtime_config if runtime_config is not None else {"model": "fake-model"},
+        runtime_state={"thread_id": "thread_1"} if is_resume else {},
+        workspace=Path("/tmp/ws"),
+        prompt="hi",
+        is_resume=is_resume,
+    )
+
+
+def test_explicit_sandbox_modes_matrix(codex_settings, monkeypatch) -> None:
+    """runtime_config.sandbox 显式配置 → 对应 CLI 参数（与宿主平台无关）。"""
+    with _make_db() as db:
+        runtime = CodexAgentRuntime(db)
+        cases = {
+            "bypass": ["--dangerously-bypass-approvals-and-sandbox"],
+            "workspace-write": ["-s", "workspace-write"],
+            "read-only": ["-s", "read-only"],
+            "danger-full-access": ["-s", "danger-full-access"],
+        }
+        for mode, expected in cases.items():
+            args = runtime._build_args(_prepared(runtime_config={"sandbox": mode}))
+            for token in expected:
+                assert token in args, f"mode={mode} 缺 {token}"
+            if mode in {"read-only", "danger-full-access", "workspace-write"}:
+                assert "--approve-for-me" not in args
+                assert "--dangerously-bypass-approvals-and-sandbox" not in args
+
+
+def test_unknown_sandbox_falls_back_to_default(codex_settings, monkeypatch) -> None:
+    monkeypatch.setattr(codex_mod, "_DEFAULT_SANDBOX", "workspace-write")
+    with _make_db() as db:
+        args = CodexAgentRuntime(db)._build_args(_prepared(runtime_config={"sandbox": "nope"}))
+    assert "-s" in args and "workspace-write" in args
+
+
+def test_posix_default_sandbox_is_workspace_write(codex_settings, monkeypatch) -> None:
+    """Linux/容器默认：-s workspace-write + staffdeck MCP 自动放行。"""
+    monkeypatch.setattr(codex_mod, "_DEFAULT_SANDBOX", "workspace-write")
+    with _make_db() as db:
+        args = CodexAgentRuntime(db)._build_args(_prepared())
+    assert "-s" in args
+    assert "workspace-write" in args
+    assert "--approve-for-me" not in args
+    assert "--dangerously-bypass-approvals-and-sandbox" not in args
+    assert 'mcp_servers.staffdeck.default_tools_approval_mode="approve"' in args
+    assert any(a.startswith("mcp_servers.staffdeck.url=") for a in args)
+
+
+def test_resume_uses_sandbox_mode_config_override(codex_settings, monkeypatch) -> None:
+    """resume：不带 -C 与审批 flag，用 -c sandbox_mode 覆盖 thread 沙箱。"""
+    monkeypatch.setattr(codex_mod, "_DEFAULT_SANDBOX", "workspace-write")
+    with _make_db() as db:
+        args = CodexAgentRuntime(db)._build_args(_prepared(is_resume=True))
+    assert "resume" in args
+    assert "thread_1" in args
+    assert 'sandbox_mode="workspace-write"' in args
+    assert "-C" not in args
+    assert "--approve-for-me" not in args
+    assert "--dangerously-bypass-approvals-and-sandbox" not in args
+    assert 'mcp_servers.staffdeck.default_tools_approval_mode="approve"' in args
+
+
+def test_default_sandbox_follows_host_platform(codex_settings) -> None:
+    """默认值与宿主平台绑定：nt=bypass、其他=workspace-write。"""
+    expected = "bypass" if os.name == "nt" else "workspace-write"
+    assert codex_mod._DEFAULT_SANDBOX == expected
+    with _make_db() as db:
+        args = CodexAgentRuntime(db)._build_args(_prepared())
+    if expected == "bypass":
+        assert "--dangerously-bypass-approvals-and-sandbox" in args
+    else:
+        assert "-s" in args and "workspace-write" in args
+
+
+# ---------------------------------------------------------------------------
+# 知识引用：query_knowledge 结构化证据 → 回复重编号 + 消息元数据
+# ---------------------------------------------------------------------------
+
+
+def test_knowledge_citations_injected_from_mcp_results(codex_settings, monkeypatch) -> None:
+    """codex 调用 query_knowledge 后，证据包生成 knowledge_citations 并按回复
+    文本中 [n] 首次出现顺序重编号，写入 assistant message metadata。"""
+    monkeypatch.setenv("FAKE_CODEX_SCENARIO", "knowledge_citation")
+    with _make_db() as db:
+        _seed(db)
+        response = CodexAgentRuntime(db).handle_turn(_request())
+
+        messages = list(
+            db.exec(select(Message).where(Message.session_id == response.session_id)).all()
+        )
+        assistant = messages[-1]
+        citations = assistant.metadata_json.get("knowledge_citations")
+        assert isinstance(citations, list) and len(citations) == 2
+        # 回复文本中 [2]（请假流程）先出现 → 重编号为 [1]
+        assert citations[0]["label"] == "[1]"
+        assert "请假" in str(citations[0].get("title") or "")
+        assert citations[1]["label"] == "[2]"
+        assert "迟到" in str(citations[1].get("title") or "")
+        # 回复文本标签同步重编号
+        assert "根据 [1] 请假需提前一天" in assistant.content
+        assert "[1] 提到迟到" not in assistant.content
+
+
+def test_knowledge_citations_skipped_without_mcp_results(codex_settings) -> None:
+    """没有 query_knowledge 调用的回合不生成引用元数据。"""
+    with _make_db() as db:
+        _seed(db)
+        response = CodexAgentRuntime(db).handle_turn(_request())
+        messages = list(
+            db.exec(select(Message).where(Message.session_id == response.session_id)).all()
+        )
+        assistant = messages[-1]
+        assert "knowledge_citations" not in assistant.metadata_json
+
+
+# ---------------------------------------------------------------------------
+# staffdeck MCP 调用去重：成功调用由网关审计记录，适配器不重复转发
+# ---------------------------------------------------------------------------
+
+
+def test_staffdeck_mcp_success_not_forwarded_as_tool_result(codex_settings, monkeypatch) -> None:
+    """staffdeck 的成功 MCP 调用由网关侧审计记录 tool_result（execute_gateway_tool），
+    适配器不再从 codex 转录重复转发，避免同一次调用显示两张工具卡片。"""
+    monkeypatch.setenv("FAKE_CODEX_SCENARIO", "mcp_tool_success")
+    with _make_db() as db:
+        _seed(db)
+        events = list(CodexAgentRuntime(db).handle_turn_stream(_request()))
+        kinds = [event["event"] for event in events]
+        assert "tool_result" not in kinds
+        assert kinds[-2:] == ["stream_end", "complete"]
+
+        session_id = events[-1]["data"]["session_id"]
+        activity = list(
+            db.exec(
+                select(AgentEvent).where(
+                    AgentEvent.session_id == session_id,
+                    AgentEvent.event_type == "tool_result",
+                )
+            ).all()
+        )
+        assert activity == []
+
+
+def test_staffdeck_mcp_error_still_forwarded(codex_settings, monkeypatch) -> None:
+    """JSON-RPC 级失败（如未知工具）网关不落审计事件，仍需转录兜底展示，
+    否则失败调用在界面完全不可见。"""
+    monkeypatch.setenv("FAKE_CODEX_SCENARIO", "mcp_tool_error")
+    with _make_db() as db:
+        _seed(db)
+        events = list(CodexAgentRuntime(db).handle_turn_stream(_request()))
+        session_id = events[-1]["data"]["session_id"]
+        activity = list(
+            db.exec(
+                select(AgentEvent).where(
+                    AgentEvent.session_id == session_id,
+                    AgentEvent.event_type == "tool_result",
+                )
+            ).all()
+        )
+        assert len(activity) == 1
+        payload = activity[0].payload_json
+        assert payload["toolId"] == "mcp.staffdeck.unknown_tool"
+        assert payload["isError"] is True

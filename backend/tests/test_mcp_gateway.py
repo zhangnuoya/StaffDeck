@@ -174,6 +174,9 @@ def test_initialize_and_tools_list() -> None:
         assert "demo_echo" in names
         echo = next(tool for tool in tools if tool["name"] == "demo_echo")
         assert echo["inputSchema"] == {"type": "object"}
+        # seed 中 agent_codex 未绑定任何通用技能：描述不含个性化清单
+        skill_tool = next(tool for tool in tools if tool["name"] == "run_general_skill")
+        assert "Available skills" not in skill_tool["description"]
 
         unknown = client.post(f"/api/mcp/{token}", json=_rpc("resources/list"))
         assert unknown.json()["error"]["code"] == -32601
@@ -290,6 +293,38 @@ def test_run_general_skill_rejects_unbound_or_unpublished() -> None:
         )
         assert missing.json()["result"]["isError"] is True
         assert "不存在或未发布" in missing.json()["result"]["content"][0]["text"]
+
+
+def test_run_general_skill_description_lists_bound_skills() -> None:
+    """tools/list 里 run_general_skill 的描述带员工绑定的技能清单（按 agent 隔离）。"""
+    with _make_db() as db:
+        _seed(db)
+        db.add(
+            AgentResourceBinding(
+                id=new_id("agentres"),
+                tenant_id="tenant_demo",
+                agent_id="agent_codex",
+                resource_type="general_skill",
+                resource_id="gs_clean",
+                status="active",
+                metadata_json=agent_private_metadata("agent_codex"),
+            )
+        )
+        db.commit()
+        client = _make_client(db)
+
+        listed = client.post(f"/api/mcp/{_token()}", json=_rpc("tools/list"))
+        tools = listed.json()["result"]["tools"]
+        skill_tool = next(tool for tool in tools if tool["name"] == "run_general_skill")
+        assert "data-clean: 数据清洗" in skill_tool["description"]
+
+        # 其他员工（未绑定）看不到该技能清单
+        other = client.post(
+            f"/api/mcp/{_token(agent_id='agent_other')}", json=_rpc("tools/list")
+        )
+        other_tools = other.json()["result"]["tools"]
+        other_skill = next(tool for tool in other_tools if tool["name"] == "run_general_skill")
+        assert "Available skills" not in other_skill["description"]
 
 
 def test_unknown_gateway_tool_is_a_jsonrpc_error() -> None:

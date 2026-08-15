@@ -1,0 +1,89 @@
+# XWorker 一体化容器（StaffDeck + Codex）生产部署编排
+#
+# 镜像由当前仓库源码构建（不拉取任何外部 StaffDeck 包/镜像）：
+#   docker build -f docker/Dockerfile -t xworker .
+#   docker compose up -d
+#
+# 数据持久化：所有状态都在命名卷 / bind mount 中，
+#   重建镜像、recreate 容器均不丢数据；docker compose down -v 会删除卷数据！
+#
+# 前置要求：
+#   - Docker >= 20.10
+#   - Linux 内核 >= 5.13（codex workspace-write 沙箱依赖 landlock）
+#   - 宿主编已创建工作区目录，并将其路径填入下方 bind mount
+#     （对应环境变量 CODEX_WORKSPACE_ROOT 的宿主端）
+
+services:
+  xworker:
+    image: xworker:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: xworker
+    ports:
+      - "5173:5173"          # StaffDeck 单端口（API + 前端页面）
+      - "3005:3000"          # cc-switch-web 管理界面（生产建议仅本机或加反向代理）
+    # 公共 DNS 优先：避免 Docker 内嵌 DNS 转发外部域名慢（api.deepseek.com 曾实测 10s+）
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+    # StaffDeck 与 codex 同容器，互访走 127.0.0.1（TOOL_BASE_URL），
+    # 不再依赖 host.docker.internal；下方 extra_hosts 仅为兼容保留。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # StaffDeck 数据库（sqlite + WAL）/ 日志 / 用户数据 —— 数据库全新开始
+      - xworker-staffdeck-data:/opt/staffdeck/staffdeck-data
+      # npx 缓存（staffdeck 的 npm 缓存）：前端配置 npx 形式 stdio MCP 时
+      # 首次下载后持久化，容器 recreate 后缓存仍命中
+      - xworker-npx-cache:/home/staffdeck/.npm
+      # uv 缓存：前端配置 uvx 形式 stdio MCP 时同上
+      - xworker-uv-cache:/home/staffdeck/.cache/uv
+      # codex 登录态(auth.json)/配置(config.toml)/模型目录(model-catalog.json)/会话存储
+      - xworker-codex-home:/home/appuser/.codex
+      # 飞书 bridge 绑定信息
+      - xworker-lark-home:/home/appuser/.lark-channel
+      # cc-switch-web 数据
+      - xworker-ccswitch-home:/home/appuser/.cc-switch
+      # 员工工作区：与下方 CODEX_WORKSPACE_ROOT 的容器端路径对应
+      # （本地 Docker Desktop 调试可改为 Windows 路径，如
+      #   E:/My_Files/Project/StaffDeck/workspace:/home/appuser/workspace）
+      - /opt/staffdeck/workspace:/home/appuser/workspace
+    environment:
+      # ---- StaffDeck 核心（容器内路径，勿改） ----
+      DATABASE_URL: "sqlite:////opt/staffdeck/staffdeck-data/skill_agent_loop.db"
+      ULTRARAG_DATA_DIR: "/opt/staffdeck/staffdeck-data/user-data"
+      TOOL_BASE_URL: "http://127.0.0.1:5173"
+      # ---- 通用技能运行时：构建期已预装依赖，运行时不联网装包 ----
+      GENERAL_SKILL_RUNTIME_AUTO_INSTALL: "false"
+      GENERAL_SKILL_RUNTIME_PYTHON: "/opt/staffdeck/runtime-venv/bin/python"
+      # ---- Codex（同容器本地 CLI，backend 直接调用） ----
+      # 双用户分离：后端(staffdeck)经 codex-run 包装器（sudo -H -u appuser）
+      # 以 appuser 身份执行 codex，后端文件对 codex 的 shell 不可见。
+      CODEX_CLI_PATH: "/usr/local/bin/codex-run"
+      # 与 bind mount 的容器端对应：/home/appuser/workspace 下的 staffdeck 子目录
+      CODEX_WORKSPACE_ROOT: "/home/appuser/workspace/staffdeck"
+      # ---- 部署者按需修改 ----
+      # 前端访问地址（服务器部署改为 http://<服务器IP>:5173；逗号分隔多 origin）
+      CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173"
+      # 以下密钥类建议通过 backend/.env 注入（取消 env_file 注释），
+      # environment 优先级高于 env_file，容器路径类配置不会被 .env 覆盖。
+      # APP_SECRET / DEMO_MODEL_API_KEY / DEMO_MODEL_NAME / CHANNEL_SECRET 等见 backend/.env.example
+    # 从仓库 backend/.env 注入密钥与业务配置（服务器上若无 .env 先 cp .env.example .env）
+    # env_file:
+    #   - ../backend/.env
+    # 多员工共享本容器：限制资源防止单个任务拖垮全员
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8g
+    restart: unless-stopped
+
+volumes:
+  xworker-staffdeck-data:
+  xworker-npx-cache:
+  xworker-uv-cache:
+  xworker-codex-home:
+  xworker-lark-home:
+  xworker-ccswitch-home:

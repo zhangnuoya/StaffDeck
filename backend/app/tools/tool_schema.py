@@ -81,6 +81,10 @@ class ToolResult(BaseModel):
     success: bool
     data: Optional[Any] = None
     error: Optional[ToolError] = None
+    # 结构化结果（与 data 文本并行，供 MCP structuredContent 透传）：
+    # 外部运行时（codex 等）可读取结构化字段（如知识检索的证据包），
+    # 会话引擎则继续消费 data 文本。
+    structured: Optional[Any] = None
 
 
 class ToolTestRequest(BaseModel):

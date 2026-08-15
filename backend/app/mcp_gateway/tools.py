@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from sqlmodel import Session, select
 
 from app.agents.branching import model_for_agent, visible_knowledge_base_ids, visible_tool_rows
-from app.capabilities.contracts import CapabilityContext
+from app.capabilities.contracts import CapabilityContext, GeneralSkillSummary
 from app.capabilities.local_general_skill import LocalGeneralSkillCatalog
 from app.db.models import GeneralSkill, new_id
 from app.general_skills.runner import GeneralSkillRunner
@@ -33,7 +34,15 @@ class GatewayToolError(Exception):
     """Raised for protocol-level failures (unknown tool, bad arguments)."""
 
 
-def _builtin_tool_descriptors() -> list[dict[str, Any]]:
+def _builtin_tool_descriptors(
+    general_skills: Sequence[GeneralSkillSummary] | None = None,
+) -> list[dict[str, Any]]:
+    # 员工绑定的已发布技能清单动态拼进 run_general_skill 描述：
+    # 外部运行时（codex 等）只看到这一个入口工具，没有清单会盲试 slug。
+    skill_hint = ""
+    if general_skills:
+        listing = ", ".join(f"{skill.slug}: {skill.name}" for skill in general_skills)
+        skill_hint = f" Available skills: [{listing}]."
     return [
         {
             "name": "query_knowledge",
@@ -74,6 +83,7 @@ def _builtin_tool_descriptors() -> list[dict[str, Any]]:
             "description": (
                 "Run a published general skill (code-generation runner) bound to this digital "
                 "employee by slug, e.g. data analysis or document generation skills."
+                + skill_hint
             ),
             "inputSchema": {
                 "type": "object",
@@ -91,8 +101,22 @@ def gateway_tool_descriptors(db: Session, grant: CapabilityGrant) -> list[dict[s
     """Return the tools this agent can see: the three builtins plus every bound Tool
     rendered with its native name and ``inputSchema`` so external runtimes (Codex,
     Claude Code) discover and call them directly instead of via ``call_tool``.
+
+    The ``run_general_skill`` description is personalized with the general skills
+    visible to this employee, so external runtimes know which slugs exist instead
+    of guessing and hitting NOT_ALLOWED.
     """
-    descriptors = _builtin_tool_descriptors()
+    context = CapabilityContext(
+        request_id=new_id("req"),
+        tenant_id=grant.tenant_id,
+        agent_id=grant.agent_id,
+        user_id="mcp_gateway",
+        session_id=grant.session_id,
+        turn_id=grant.turn_id,
+        channel="mcp",
+    )
+    visible_skills = LocalGeneralSkillCatalog(db).list_published(context)
+    descriptors = _builtin_tool_descriptors(visible_skills)
     seen = {entry["name"] for entry in descriptors}
     tools = visible_tool_rows(db, grant.tenant_id, grant.agent_id, include_inactive=False)
     for tool in tools:
@@ -243,10 +267,15 @@ def _mcp_tool_result(result: ToolResult) -> dict[str, Any]:
         )
     else:
         text = result.error.message if result.error else "tool call failed"
-    return {
+    payload: dict[str, Any] = {
         "content": [{"type": "text", "text": text or "(empty result)"}],
         "isError": not result.success,
     }
+    if result.structured is not None:
+        # MCP CallToolResult.structuredContent：把结构化证据（知识检索的证据包等）
+        # 透传给外部运行时（codex 会放入 item.result.structured_content）。
+        payload["structuredContent"] = result.structured
+    return payload
 
 
 # Builtin runners keyed by their tool name; native (bound-Tool) names resolve
@@ -283,20 +312,45 @@ def _query_knowledge(db: Session, grant: CapabilityGrant, arguments: dict[str, A
             query=query,
             knowledge_base_ids=knowledge_base_ids,
             max_chunks=max_chunks,
-            need_evidence_pack=False,
+            need_evidence_pack=True,
         )
     )
+    # 文本编号与证据包对齐：只对证据包收录的 chunk 编号，避免相关性过滤造成
+    # 文本 [n] 与 evidence_pack 顺序错位；证据包为空时退化为按 chunks 顺序编号。
+    evidence_chunk_ids = {str(item.get("chunk_id")) for item in response.evidence_pack}
     lines: list[str] = []
-    for index, chunk in enumerate(response.chunks[:max_chunks], start=1):
+    number = 0
+    for chunk in response.chunks[:max_chunks]:
         content = (chunk.content or "").strip()
-        if content:
-            lines.append(f"[{index}] {content}")
+        if not content:
+            continue
+        if evidence_chunk_ids and str(chunk.id) not in evidence_chunk_ids:
+            continue
+        number += 1
+        lines.append(f"[{number}] {content}")
     data = {
         "query": query,
         "chunk_count": len(lines),
         "text": "\n\n".join(lines) if lines else "未检索到相关内容。",
     }
-    return ToolResult(tool_name="query_knowledge", success=True, data=data["text"], error=None)
+    # 结构化证据包（MCP structuredContent）：与原生引擎 response_items 同构，
+    # 供会话层生成 knowledge_citations（引用卡片）与前端复用渲染链路。
+    structured = {
+        "query": query,
+        "chunks": [item.model_dump(mode="json") for item in response.chunks[:max_chunks]],
+        "selected_documents": response.selected_documents,
+        "selected_concepts": response.selected_concepts,
+        "okf_citations": response.okf_citations,
+        "evidence_pack": response.evidence_pack,
+        "trace": response.route_trace or response.trace,
+    }
+    return ToolResult(
+        tool_name="query_knowledge",
+        success=True,
+        data=data["text"],
+        structured=structured,
+        error=None,
+    )
 
 
 def _call_tool(db: Session, grant: CapabilityGrant, arguments: dict[str, Any]) -> ToolResult:
