@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import queue
@@ -27,6 +28,9 @@ from app.general_skills.schema import (
     GeneralSkillRunResponse,
     GeneralSkillSelection,
 )
+from app.harness.artifacts import HarnessArtifactAccessError, normalize_harness_artifact_path
+from app.harness.command import run_sandboxed_process
+from app.harness.errors import HarnessExecutionError
 from app.llm import LLMClient, LLMError
 from app.llm.model_config_resolver import snapshot_model_config
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
@@ -43,7 +47,9 @@ RUN_TIMEOUT_SECONDS = 12
 MAX_OUTPUT_CHARS = 20000
 GENERAL_SKILL_MAX_TOKENS = 8192
 GENERAL_SKILL_MAX_ATTEMPTS = 10
+MAX_DECLARED_ARTIFACTS = 20
 TraceSink = Callable[[dict[str, Any]], None]
+CancellationCheck = Callable[[], bool]
 GENERAL_SKILL_SELECTION_OUTPUT = {
     "use_general_skill": "boolean",
     "selected_slug": "string?",
@@ -73,6 +79,10 @@ GENERAL_SKILL_REVIEW_OUTPUT = {
     "repair_hint": "string?",
 }
 GENERAL_SKILL_REPLY_OUTPUT = {"reply": "string"}
+
+
+class GeneralSkillExecutionCancelled(RuntimeError):
+    pass
 
 
 class GeneralSkillSelector:
@@ -211,9 +221,15 @@ class GeneralSkillRunner:
         event_sink: TraceSink | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        workspace_root: Path | None = None,
+        is_cancelled: CancellationCheck | None = None,
+        sandbox_network_mode: str = "all",
+        sandbox_allowed_domains: tuple[str, ...] = (),
+        sandbox_enabled: bool = True,
     ) -> GeneralSkillRunResponse:
         trace: list[dict[str, Any]] = []
         max_attempts = max(1, min(max_attempts, GENERAL_SKILL_MAX_ATTEMPTS))
+        _raise_if_cancelled(is_cancelled)
         _emit(trace, {"phase": "skill_loaded", "message": f"已加载通用技能 {skill.name}", "slug": skill.slug}, event_sink)
         try:
             plan, planning_attempts = self._generate_plan_with_reflection(
@@ -226,6 +242,7 @@ class GeneralSkillRunner:
                 conversation_context,
                 memory_context,
             )
+            _raise_if_cancelled(is_cancelled)
         except LLMError as exc:
             _emit(trace, {"phase": "plan_failed", "message": "模型生成 runner 失败", "error": str(exc)}, event_sink)
             return GeneralSkillRunResponse(
@@ -243,21 +260,28 @@ class GeneralSkillRunner:
         stderr = ""
         structured_result: dict[str, Any] = {}
         for attempt in range(1, max_attempts + 1):
+            _raise_if_cancelled(is_cancelled)
             _emit(
                 trace,
                 {"phase": "attempt_started", "message": f"开始第 {attempt} 次运行", "attempt": attempt},
                 event_sink,
             )
+            supported = inspect.signature(self._execute_plan).parameters
+            optional_controls = {
+                "workspace_root": workspace_root,
+                "is_cancelled": is_cancelled,
+                "sandbox_network_mode": sandbox_network_mode,
+                "sandbox_allowed_domains": sandbox_allowed_domains,
+                "sandbox_enabled": sandbox_enabled,
+            }
+            execute_kwargs = {
+                key: value for key, value in optional_controls.items() if key in supported
+            }
             stdout, stderr, structured_result = self._execute_plan(
-                skill,
-                query,
-                plan,
-                user_id,
-                trace,
-                event_sink,
-                attempt,
+                skill, query, plan, user_id, trace, event_sink, attempt, **execute_kwargs
             )
             _normalize_failure_diagnostics(structured_result)
+            _raise_if_cancelled(is_cancelled)
             review = self._review_execution_result(
                 skill,
                 query,
@@ -272,6 +296,13 @@ class GeneralSkillRunner:
                 conversation_context,
                 memory_context,
             )
+            if (
+                structured_result.get("retryable") is False
+                or structured_result.get("infrastructure_failure") is True
+            ):
+                review["needs_retry"] = False
+                review["terminal"] = True
+            _raise_if_cancelled(is_cancelled)
             attempts.append(
                 {
                     "attempt": attempt,
@@ -339,6 +370,7 @@ class GeneralSkillRunner:
                     conversation_context,
                     memory_context,
                 )
+                _raise_if_cancelled(is_cancelled)
             except LLMError as exc:
                 _emit(
                     trace,
@@ -348,6 +380,7 @@ class GeneralSkillRunner:
                 break
 
         try:
+            _raise_if_cancelled(is_cancelled)
             reply = self._generate_reply(
                 skill,
                 query,
@@ -360,6 +393,7 @@ class GeneralSkillRunner:
                 conversation_context,
                 memory_context,
             )
+            _raise_if_cancelled(is_cancelled)
         except LLMError as exc:
             _emit(trace, {"phase": "reply_failed", "message": "模型生成最终回复失败", "error": str(exc)}, event_sink)
             reply = _fallback_reply(structured_result)
@@ -370,6 +404,11 @@ class GeneralSkillRunner:
             stdout=stdout,
             stderr=stderr,
             structured_result=structured_result,
+            artifacts=(
+                list(structured_result.get("artifacts") or [])
+                if isinstance(structured_result.get("artifacts"), list)
+                else []
+            ),
             reply=reply,
         )
 
@@ -400,9 +439,10 @@ class GeneralSkillRunner:
                     "skill_slug": skill.slug,
                     "skill_name": skill.name,
                     "skill_workspace": "<runtime absolute path to the restored skill folder>",
+                    "output_dir": "<runtime absolute path for final downloadable files>",
                     "skill_files": [file["path"] for file in _skill_files(skill)],
                 },
-                "timeout_seconds": RUN_TIMEOUT_SECONDS,
+                "timeout_seconds": _run_timeout_seconds(skill),
             },
         }
         payload = stage_payload(
@@ -560,9 +600,10 @@ class GeneralSkillRunner:
                     "skill_slug": skill.slug,
                     "skill_name": skill.name,
                     "skill_workspace": "<runtime absolute path to the restored skill folder>",
+                    "output_dir": "<runtime absolute path for final downloadable files>",
                     "skill_files": [file["path"] for file in _skill_files(skill)],
                 },
-                "timeout_seconds": RUN_TIMEOUT_SECONDS,
+                "timeout_seconds": _run_timeout_seconds(skill),
             },
             "previous_attempts": attempts[-3:],
         }
@@ -609,10 +650,27 @@ class GeneralSkillRunner:
         trace: list[dict[str, Any]],
         event_sink: TraceSink | None = None,
         attempt: int = 1,
+        workspace_root: Path | None = None,
+        is_cancelled: CancellationCheck | None = None,
+        sandbox_network_mode: str | None = None,
+        sandbox_allowed_domains: tuple[str, ...] | None = None,
+        sandbox_enabled: bool = True,
     ) -> tuple[str, str, dict[str, Any]]:
-        run_dir = Path(mkdtemp(prefix="ultrarag_general_skill_"))
+        sandbox_network_mode = sandbox_network_mode or "all"
+        sandbox_allowed_domains = sandbox_allowed_domains or ()
+        _raise_if_cancelled(is_cancelled)
+        if workspace_root is not None:
+            workspace_root.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(
+            mkdtemp(
+                prefix="general_skill_",
+                dir=str(workspace_root) if workspace_root is not None else None,
+            )
+        )
         skill_dir = run_dir / "skill"
         _materialize_skill_package(skill, skill_dir)
+        artifact_dir = run_dir / "artifacts"
+        artifact_dir.mkdir()
         runtime = _plan_runtime(plan)
         runner_path = run_dir / ("runner.sh" if runtime == "bash" else "runner.py")
         runner_path.write_text(plan.code, encoding="utf-8")
@@ -622,6 +680,7 @@ class GeneralSkillRunner:
             "skill_name": skill.name,
             "user_id": user_id,
             "skill_workspace": str(skill_dir),
+            "artifact_dir": str(artifact_dir),
             "skill_files": [file["path"] for file in _skill_files(skill)],
         }
         _emit(
@@ -637,7 +696,7 @@ class GeneralSkillRunner:
         )
         try:
             runtime_python = ensure_runtime_python()
-            env = runtime_environment(os.environ.copy())
+            env = runtime_environment(os.environ.copy(), python_path=runtime_python)
         except GeneralSkillRuntimeError as exc:
             structured = {
                 "success": False,
@@ -662,6 +721,7 @@ class GeneralSkillRunner:
                 "ARGUMENTS": query,
                 "QUERY": query,
                 "SKILL_WORKSPACE": str(skill_dir),
+                "ARTIFACT_DIR": str(artifact_dir),
                 "SKILL_SLUG": skill.slug,
                 "SKILL_NAME": skill.name,
                 "USER_ID": user_id,
@@ -681,25 +741,44 @@ class GeneralSkillRunner:
             return "", structured["message"], structured
         command = ["/bin/bash", str(runner_path)] if runtime == "bash" else [str(runtime_python), str(runner_path)]
         cwd = str(skill_dir if runtime == "bash" else run_dir)
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cwd,
-            env=env,
-            text=False,
-        )
-        if process.stdin:
-            process.stdin.write(json.dumps(stdin_payload, ensure_ascii=False).encode("utf-8"))
-            process.stdin.close()
-
+        if is_cancelled and is_cancelled():
+            raise GeneralSkillExecutionCancelled("General skill execution cancelled.")
         try:
-            stdout, stderr, timed_out = _stream_process_output(process, trace, event_sink, attempt)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
+            result = run_sandboxed_process(
+                # The runner and materialized package share one workspace.
+                workspace=run_dir,
+                argv=command,
+                stdin_json=stdin_payload,
+                stdin_path_keys=("skill_workspace", "artifact_dir"),
+                cwd=Path(cwd),
+                timeout_seconds=_run_timeout_seconds(skill),
+                output_limit=MAX_OUTPUT_CHARS * 4,
+                env=env,
+                env_path_keys=("SKILL_WORKSPACE", "ARTIFACT_DIR"),
+                network_mode=sandbox_network_mode,
+                allowed_domains=sandbox_allowed_domains,
+                sandbox_enabled=sandbox_enabled,
+                is_cancelled=is_cancelled,
+            )
+        except HarnessExecutionError as exc:
+            if exc.error.code == "SANDBOX_EXECUTION_CANCELLED":
+                raise GeneralSkillExecutionCancelled(str(exc)) from exc
+            raise
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        timed_out = result.timed_out
+        if stdout:
+            _emit(
+                trace,
+                {"phase": "stdout_chunk", "message": "收到运行输出", "attempt": attempt, "text": stdout},
+                event_sink,
+            )
+        if stderr:
+            _emit(
+                trace,
+                {"phase": "stderr_chunk", "message": "收到错误输出", "attempt": attempt, "text": stderr},
+                event_sink,
+            )
 
         if timed_out:
             stdout = _truncate(stdout)
@@ -720,10 +799,15 @@ class GeneralSkillRunner:
             )
             return stdout, stderr, structured
 
-        return_code = process.wait()
+        return_code = result.returncode
         stdout = _truncate(stdout)
         stderr = _truncate(stderr)
         structured = _parse_stdout_json(stdout)
+        _normalize_declared_artifacts(
+            structured,
+            artifact_root=artifact_dir,
+            workspace_root=workspace_root,
+        )
         if return_code != 0:
             structured.setdefault("success", False)
             structured.setdefault("error", f"runner exited with code {return_code}")
@@ -946,6 +1030,13 @@ def _skill_package_payload(skill: GeneralSkill, preview_limit: int = 12000) -> d
 
 def _materialize_skill_package(skill: GeneralSkill, target_dir: Path) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
+    metadata = getattr(skill, "metadata_json", None)
+    directory_values = metadata.get("skill_directories", []) if isinstance(metadata, Mapping) else []
+    if isinstance(directory_values, Sequence) and not isinstance(directory_values, (str, bytes)):
+        for value in directory_values:
+            relative_path = _safe_package_path(str(value or ""))
+            if relative_path:
+                (target_dir / relative_path).mkdir(parents=True, exist_ok=True)
     for file in _skill_files(skill):
         relative_path = _safe_package_path(str(file["path"]))
         output_path = target_dir / relative_path
@@ -961,6 +1052,17 @@ def _safe_package_path(path: str) -> str:
     return "/".join(parts)
 
 
+def _safe_artifact_text(value: Any, max_length: int) -> str | None:
+    if value is None:
+        return None
+    cleaned = "".join(
+        character
+        for character in str(value).strip()
+        if ord(character) >= 32 and ord(character) != 127
+    )
+    return cleaned[:max_length] or None
+
+
 def _parse_stdout_json(stdout: str) -> dict[str, Any]:
     stripped = stdout.strip()
     if not stripped:
@@ -974,11 +1076,91 @@ def _parse_stdout_json(stdout: str) -> dict[str, Any]:
         return {"success": True, "text": stripped}
 
 
+def _normalize_declared_artifacts(
+    structured: dict[str, Any],
+    *,
+    artifact_root: Path,
+    workspace_root: Path | None,
+) -> None:
+    declarations = structured.get("artifacts")
+    if declarations is None:
+        return
+    declaration_errors: list[dict[str, str]] = []
+    if not isinstance(declarations, list) or workspace_root is None:
+        structured["artifacts"] = []
+        structured["artifact_errors"] = [
+            {
+                "path": "",
+                "code": "artifact_declaration_invalid",
+                "message": "artifacts 必须是当前运行目录下的相对路径列表。",
+            }
+        ]
+        return
+    normalized: list[dict[str, Any]] = []
+    for declaration in declarations[:MAX_DECLARED_ARTIFACTS]:
+        raw_path = declaration.get("path") if isinstance(declaration, Mapping) else declaration
+        try:
+            relative = normalize_harness_artifact_path(str(raw_path or ""))
+            task_relative = (artifact_root / relative).relative_to(workspace_root).as_posix()
+            item: dict[str, Any] = {"path": task_relative}
+            if isinstance(declaration, Mapping):
+                display_name = _safe_artifact_text(declaration.get("display_name"), 180)
+                description = _safe_artifact_text(declaration.get("description"), 500)
+                if display_name:
+                    item["display_name"] = display_name
+                if description:
+                    item["description"] = description
+            normalized.append(item)
+        except (HarnessArtifactAccessError, ValueError):
+            declaration_errors.append(
+                {
+                    "path": str(raw_path or ""),
+                    "code": "artifact_declaration_invalid",
+                    "message": "产物路径必须位于当前运行目录，且只能使用相对路径。",
+                }
+            )
+    if len(declarations) > MAX_DECLARED_ARTIFACTS:
+        declaration_errors.append(
+            {
+                "path": "",
+                "code": "artifact_declaration_limit_exceeded",
+                "message": f"产物声明最多允许 {MAX_DECLARED_ARTIFACTS} 个文件。",
+            }
+        )
+    structured["artifacts"] = normalized
+    if declaration_errors:
+        structured["artifact_errors"] = declaration_errors
+
+
+def _run_timeout_seconds(skill: GeneralSkill) -> float:
+    runtime_config = getattr(skill, "runtime_config_json", None)
+    config = runtime_config if isinstance(runtime_config, Mapping) else {}
+    try:
+        timeout = float(config.get("timeout_seconds") or RUN_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        timeout = float(RUN_TIMEOUT_SECONDS)
+    return max(1.0, min(timeout, 120.0))
+
+
+def _raise_if_cancelled(
+    is_cancelled: CancellationCheck | None,
+    *,
+    process: subprocess.Popen[bytes] | None = None,
+) -> None:
+    if not callable(is_cancelled) or not is_cancelled():
+        return
+    if process is not None and process.poll() is None:
+        process.kill()
+    raise GeneralSkillExecutionCancelled("General skill execution was cancelled.")
+
+
 def _stream_process_output_selectors(
     process: subprocess.Popen[bytes],
     trace: list[dict[str, Any]],
     event_sink: TraceSink | None,
     attempt: int,
+    timeout_seconds: float = RUN_TIMEOUT_SECONDS,
+    is_cancelled: CancellationCheck | None = None,
 ) -> tuple[str, str, bool]:
     selector = selectors.DefaultSelector()
     stdout_parts: list[str] = []
@@ -992,10 +1174,11 @@ def _stream_process_output_selectors(
         os.set_blocking(stream.fileno(), False)
         selector.register(stream, selectors.EVENT_READ, data=name)
 
-    deadline = time.monotonic() + RUN_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
     timed_out = False
     try:
         while selector.get_map():
+            _raise_if_cancelled(is_cancelled, process=process)
             if time.monotonic() > deadline:
                 timed_out = True
                 process.kill()
@@ -1038,14 +1221,42 @@ def _use_thread_reader() -> bool:
     return sys.platform == "win32"
 
 
-def _stream_process_output(process, trace, event_sink, attempt):
+def _stream_process_output(
+    process,
+    trace,
+    event_sink,
+    attempt,
+    timeout_seconds=RUN_TIMEOUT_SECONDS,
+    is_cancelled=None,
+):
     if _use_thread_reader():
-        return _stream_process_output_threaded(process, trace, event_sink, attempt)
-    return _stream_process_output_selectors(process, trace, event_sink, attempt)
+        return _stream_process_output_threaded(
+            process,
+            trace,
+            event_sink,
+            attempt,
+            timeout_seconds,
+            is_cancelled,
+        )
+    return _stream_process_output_selectors(
+        process,
+        trace,
+        event_sink,
+        attempt,
+        timeout_seconds,
+        is_cancelled,
+    )
 
 
-def _stream_process_output_threaded(process, trace, event_sink, attempt):
-    q: "queue.Queue[tuple[str, bytes]]" = queue.Queue()
+def _stream_process_output_threaded(
+    process,
+    trace,
+    event_sink,
+    attempt,
+    timeout_seconds=RUN_TIMEOUT_SECONDS,
+    is_cancelled=None,
+):
+    q: queue.Queue[tuple[str, bytes]] = queue.Queue()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
 
@@ -1066,10 +1277,11 @@ def _stream_process_output_threaded(process, trace, event_sink, attempt):
         threads.append(t)
 
     open_streams = sum(1 for s, _ in stream_map if s is not None)
-    deadline = time.monotonic() + RUN_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
     timed_out = False
     eof_count = 0
     while eof_count < open_streams:
+        _raise_if_cancelled(is_cancelled, process=process)
         if time.monotonic() > deadline:
             timed_out = True
             process.kill()

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Check, FlaskConical, LoaderCircle } from 'lucide-react';
+import { Check, FlaskConical, LoaderCircle, Trash2 } from 'lucide-react';
 
-import { api, TENANT_ID } from '../api/client';
+import { api, ApiError, TENANT_ID } from '../api/client';
 import type { EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
@@ -26,8 +26,9 @@ import {
 } from '@/components/ui';
 import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { cn } from '@/lib/utils';
-import { MENU_CONTENT_CLASS, MENU_ITEM_CLASS } from '@/lib/enterprise-ui';
+import { MENU_CONTENT_CLASS, MENU_ITEM_CLASS, MENU_ITEM_DANGER_CLASS } from '@/lib/enterprise-ui';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
 import IconEdit from '../assets/icons/edit.svg?react';
@@ -41,10 +42,11 @@ import type { ModelConfigRead } from '../types';
 import { OPEN_MODEL_CREATE_EVENT } from '@/components/QuickStartGuide';
 
 const MODEL_PAGE_SIZE = 8;
+const MODEL_TEST_UI_TIMEOUT_MS = 100_000;
 
 type ModelForm = {
   name: string;
-  api_protocol: 'openai_chat_completions' | 'anthropic_messages' | 'gemini_generate_content';
+  api_protocol: 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages' | 'gemini_generate_content';
   base_url: string;
   model: string;
   api_key: string;
@@ -53,6 +55,25 @@ type ModelForm = {
   extra_body: string;
   is_default: boolean;
   enabled: boolean;
+};
+
+export type ModelProviderErrorDetail = {
+  code: string;
+  message: string;
+  upstream_status?: number | null;
+  provider_code?: string | null;
+  provider_message?: string | null;
+  upstream_body?: string | null;
+  request_id?: string | null;
+  retryable?: boolean;
+};
+
+type ModelTestResponse = {
+  success: boolean;
+  message: string;
+  output?: string;
+  activated: boolean;
+  error?: ModelProviderErrorDetail | null;
 };
 
 const BLANK_MODEL_FORM: ModelForm = {
@@ -68,7 +89,37 @@ const BLANK_MODEL_FORM: ModelForm = {
   enabled: true,
 };
 
-function modelActionError(error: unknown, fallback: string): string {
+export function modelProviderErrorMessage(
+  error: ModelProviderErrorDetail | null | undefined,
+  fallback: string,
+): string {
+  if (!error) return fallback;
+  const parts = [error.code || fallback];
+  if (typeof error.upstream_status === 'number') parts.push(`HTTP ${error.upstream_status}`);
+  if (error.provider_code) parts.push(`上游错误码：${error.provider_code}`);
+  if (error.provider_message) parts.push(`上游消息：${error.provider_message}`);
+  if (error.upstream_body) parts.push(`上游响应：${error.upstream_body}`);
+  if (error.request_id) parts.push(`Request ID：${error.request_id}`);
+  return parts.join('；');
+}
+
+function providerErrorFromApiError(error: ApiError): ModelProviderErrorDetail | null {
+  try {
+    const payload = JSON.parse(error.body) as { detail?: unknown };
+    if (!payload.detail || typeof payload.detail !== 'object' || Array.isArray(payload.detail)) return null;
+    const detail = payload.detail as Partial<ModelProviderErrorDetail>;
+    if (typeof detail.code !== 'string' || typeof detail.message !== 'string') return null;
+    return detail as ModelProviderErrorDetail;
+  } catch {
+    return null;
+  }
+}
+
+export function modelActionError(error: unknown, fallback: string): string {
+  if (error instanceof ApiError) {
+    const providerError = providerErrorFromApiError(error);
+    if (providerError) return modelProviderErrorMessage(providerError, fallback);
+  }
   const message = error instanceof Error ? error.message : '';
   if (message.includes('MODEL_DEFAULT_CONFLICT')) {
     return '默认模型状态已变化，请刷新后重试';
@@ -96,6 +147,9 @@ export default function ModelsPage({
   const [selected, setSelected] = useState<ModelConfigRead | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveStage, setSaveStage] = useState<'saving' | 'testing' | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ModelConfigRead | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const testingModelIdsRef = useRef(new Set<string>());
   const [testingModelIds, setTestingModelIds] = useState<Set<string>>(new Set());
   const [form, setForm] = useState<ModelForm>(BLANK_MODEL_FORM);
@@ -209,34 +263,27 @@ export default function ModelsPage({
       temperature,
       max_output_tokens: maxOutputTokens,
       extra_body: extraBody,
-      // Activation is completed only after the automatic verification below.
-      is_default: false,
-      enabled: false,
+      is_default: form.enabled && form.is_default,
+      enabled: form.enabled,
       api_key: form.api_key || undefined,
     };
     setSaving(true);
+    setSaveStage(form.enabled ? 'testing' : 'saving');
     try {
-      let saved: ModelConfigRead;
+      const verifyQuery = form.enabled ? '?verify_before_save=true' : '';
       if (selected) {
-        saved = await api.put<ModelConfigRead>(`/api/enterprise/model-configs/${selected.id}`, payload);
+        await api.put<ModelConfigRead>(
+          `/api/enterprise/model-configs/${selected.id}${verifyQuery}`,
+          payload,
+        );
       } else {
-        saved = await api.post<ModelConfigRead>('/api/enterprise/model-configs', payload);
+        await api.post<ModelConfigRead>(`/api/enterprise/model-configs${verifyQuery}`, payload);
       }
-      let completed = true;
       if (form.enabled) {
-        const verified = await test(saved);
-        if (verified) {
-          await api.put<ModelConfigRead>(`/api/enterprise/model-configs/${saved.id}`, {
-            tenant_id: TENANT_ID,
-            enabled: true,
-            is_default: form.is_default,
-          });
-          notify.success(form.is_default ? '测试通过，已启用并设为默认模型' : '测试通过，已启用');
-        } else completed = false;
+        notify.success(form.is_default ? '测试通过，已启用并设为默认模型' : '测试通过，已启用');
       } else {
         notify.success('已保存');
       }
-      if (!completed) return;
       setEditorOpen(false);
       setSelected(null);
       setForm(BLANK_MODEL_FORM);
@@ -245,6 +292,23 @@ export default function ModelsPage({
       notify.error(modelActionError(error, '保存失败'));
     } finally {
       setSaving(false);
+      setSaveStage(null);
+    }
+  }
+
+  async function confirmDelete() {
+    const row = deleteTarget;
+    if (!row || deleting) return;
+    setDeleting(true);
+    try {
+      await api.delete(`/api/enterprise/model-configs/${row.id}?tenant_id=${TENANT_ID}`);
+      notify.success('已删除模型');
+      setDeleteTarget(null);
+      await load();
+    } catch (error) {
+      notify.error(modelActionError(error, '删除失败'));
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -262,9 +326,13 @@ export default function ModelsPage({
     if (testingModelIdsRef.current.has(row.id)) return false;
     testingModelIdsRef.current.add(row.id);
     setTestingModelIds(new Set(testingModelIdsRef.current));
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), MODEL_TEST_UI_TIMEOUT_MS);
     try {
-      const result = await api.post<{ success: boolean; message: string; output?: string; activated: boolean }>(
+      const result = await api.postWithSignal<ModelTestResponse>(
         `/api/enterprise/model-configs/${row.id}/test?tenant_id=${TENANT_ID}&activate_if_initial=true`,
+        {},
+        controller.signal,
       );
       if (result.success) {
         if (!result.activated) notify.success(result.output || result.message);
@@ -272,16 +340,21 @@ export default function ModelsPage({
       } else if (result.message === 'MODEL_VERIFICATION_STALE') {
         notify.warning('模型配置或测试状态已发生变化，本次结果未生效，请刷新后重新测试');
       } else {
-        notify.error(result.message);
+        notify.error(modelProviderErrorMessage(result.error, result.message));
       }
       return false;
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '测试失败');
+      notify.error(
+        error instanceof DOMException && error.name === 'AbortError'
+          ? '模型连接测试超时，请检查本地模型服务地址和网络后重试'
+          : error instanceof Error ? error.message : '测试失败',
+      );
       return false;
     } finally {
-      await load(false);
+      window.clearTimeout(timeoutId);
       testingModelIdsRef.current.delete(row.id);
       setTestingModelIds(new Set(testingModelIdsRef.current));
+      void load(false);
     }
   }
 
@@ -311,6 +384,15 @@ export default function ModelsPage({
           <DropdownMenuItem className={MENU_ITEM_CLASS} disabled={isTesting} onSelect={() => void test(row)}>
             {isTesting ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}
             {isTesting ? '正在测试' : '测试'}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            variant="destructive"
+            className={MENU_ITEM_DANGER_CLASS}
+            disabled={isTesting}
+            onSelect={() => setDeleteTarget(row)}
+          >
+            <Trash2 />
+            删除
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -383,7 +465,7 @@ export default function ModelsPage({
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
-      <AppHeader onLogout={onLogout} userName={currentUser?.username} title="模型" />
+      <AppHeader className="items-center" onLogout={onLogout} userName={currentUser?.username} title="模型" />
 
       <div className="mt-[20px] mb-[16px] flex items-center justify-end gap-[12px]">
         <UIButton
@@ -409,7 +491,7 @@ export default function ModelsPage({
         <div className="flex flex-wrap items-stretch gap-[20px]" aria-label="模型统计">
           <StatCard label="模型" value={rows.length} />
           <StatCard label="已启用" value={enabledCount} tone="green" />
-          <StatCard label="默认模型" value={defaultRow?.name || '-'} valueClassName="text-[18px]" />
+          <StatCard label="默认模型" value={defaultRow?.name || '-'} valueClassName="text-[18px] leading-[26px]" />
           <StatCard label="API 协议" value={providerCount} />
         </div>
 
@@ -501,6 +583,9 @@ export default function ModelsPage({
                     {availableProtocols.includes('openai_chat_completions') && (
                       <SelectItem value="openai_chat_completions">OpenAI Chat Completions</SelectItem>
                     )}
+                    {availableProtocols.includes('openai_responses') && (
+                      <SelectItem value="openai_responses">OpenAI Responses API</SelectItem>
+                    )}
                     {availableProtocols.includes('anthropic_messages') && (
                       <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
                     )}
@@ -513,7 +598,7 @@ export default function ModelsPage({
               <LabeledField label="Base URL">
                 <Input
                   value={form.base_url}
-                  placeholder={form.api_protocol === 'openai_chat_completions'
+                  placeholder={form.api_protocol === 'openai_chat_completions' || form.api_protocol === 'openai_responses'
                     ? 'https://llm-center.modelbest.cn/llm/v1'
                     : 'https://llm-center.modelbest.cn/llm'}
                   onChange={(event) => updateForm('base_url', event.target.value)}
@@ -589,11 +674,24 @@ export default function ModelsPage({
               onClick={() => void save()}
               className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
             >
-              保存
+              {saving && <LoaderCircle className="size-[14px] animate-spin" />}
+              {saveStage === 'testing' ? '测试并保存中' : saving ? '保存中' : '保存'}
             </UIButton>
           </div>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDialog
+        open={Boolean(deleteTarget)}
+        onOpenChange={(open) => !open && setDeleteTarget(null)}
+        loading={deleting}
+        title={deleteTarget ? `删除模型「${deleteTarget.name}」？` : ''}
+        description={deleteTarget?.is_default
+          ? '这是当前默认模型。删除后需要重新设置默认模型，相关数字员工中的模型绑定也会一并移除。'
+          : '删除后，相关数字员工中的模型绑定也会一并移除，操作不可撤销。'}
+        confirmText="删除"
+        onConfirm={() => void confirmDelete()}
+      />
     </div>
   );
 }

@@ -6,6 +6,7 @@ from sqlmodel import Session
 
 from app.api import (
     agents,
+    app_updates,
     auth,
     channels,
     chat,
@@ -31,12 +32,18 @@ from app.db import engine, init_db
 from app.db.seed import seed_demo_data
 from app.mcp_gateway.server import router as mcp_gateway_router
 from app.scheduled_tasks.worker import start_background_worker, stop_background_worker
+from app.public_api import create_public_api_app
+from app.public_api.jobs import cleanup_public_api_records, recover_public_jobs
+from app.public_api.webhooks import enqueue_due_webhook_deliveries
+from app.public_api.maintenance import start_public_api_maintenance, stop_public_api_maintenance
+from app.runtime_lock import acquire_runtime_instance_lock, release_runtime_instance_lock
+from app.version import app_version
 
 settings = get_settings()
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.1.0",
+    version=app_version(),
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -53,18 +60,32 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
-    init_db()
-    with Session(engine) as db:
-        seed_demo_data(db)
-    start_background_worker()
-    start_channel_services()
+    acquire_runtime_instance_lock()
+    try:
+        init_db()
+        with Session(engine) as db:
+            seed_demo_data(db)
+        start_background_worker()
+        start_channel_services()
+        if settings.public_api_enabled:
+            recover_public_jobs()
+            cleanup_public_api_records()
+            enqueue_due_webhook_deliveries()
+            start_public_api_maintenance()
+    except Exception:
+        release_runtime_instance_lock()
+        raise
 
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
-    stop_channel_services()
-    stop_background_worker()
-    shutdown_async_jobs()
+    try:
+        stop_public_api_maintenance()
+        stop_channel_services()
+        stop_background_worker()
+        shutdown_async_jobs()
+    finally:
+        release_runtime_instance_lock()
 
 
 @app.get("/api/health", tags=["health"])
@@ -72,6 +93,7 @@ def health() -> dict[str, str]:
     return {"status": "ok", "app": "StaffDeck"}
 
 
+app.include_router(app_updates.router)
 app.include_router(chat.router)
 app.include_router(agents.chat_router)
 app.include_router(ui_config.chat_router)
@@ -97,3 +119,6 @@ app.include_router(sessions.router)
 app.include_router(traces.router)
 app.include_router(mock.router)
 app.include_router(mcp_gateway_router)
+
+if settings.public_api_enabled:
+    app.mount("/api/v1", create_public_api_app())

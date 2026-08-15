@@ -43,12 +43,30 @@ StaffDeck是一套面向企业的数字员工构建与管理平台，帮助专�
 | 平台 | 架构 | 下载 |
 | --- | --- | --- |
 | macOS | Apple Silicon（arm64） | [下载 `.dmg`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-macos-arm64.dmg) |
+| macOS | Intel（x86_64） | [下载 `.dmg`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-macos-x86_64.dmg) |
 | Windows | x64 | [下载安装程序 `.exe`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-windows-x64-setup.exe) |
 | Linux | x86_64（Debian/Ubuntu） | [下载 `.deb`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-linux-x86_64.deb) |
 
+Linux 安装包默认只监听本机 `127.0.0.1`。安装后可以在终端配置监听模式和
+端口，无头服务器也适用：
+
+```bash
+staffdeck setup
+staffdeck setup --mode local --port 5173
+staffdeck setup --mode lan --port 5173
+staffdeck setup --mode public --port 5173 --public-url https://staff.example.com
+```
+
+`local` 只允许本机访问；`lan` 和 `public` 监听 `0.0.0.0`。`--port` 用来
+设置监听端口。交互式终端下，`public` 会先尝试自动推断公网 URL；如果无法
+推断，或者是在无头环境中运行，就需要显式传入 `--public-url`。公网部署建议
+使用 HTTPS 反向代理；启用 OIDC 时，`OIDC_REDIRECT_URI` 应配置为同一个公网
+URL。配置按用户保存，并在下次启动时生效。
+
 ## Agent 一键部署
 
-将下面的 Prompt 粘贴给 Cursor、Claude Code 或 Codex：
+将下面的 Prompt 粘贴给 Cursor、Claude Code 或 Codex。代码部署时，也可以用
+`ULTRARAG_HOST`、`ULTRARAG_PORT` 和 `STAFFDECK_PUBLIC_URL` 覆盖启动参数：
 
 ```text
 阅读 https://raw.githubusercontent.com/OpenBMB/StaffDeck/main/README.zh.md。
@@ -239,6 +257,10 @@ curl.exe http://127.0.0.1:5173/api/health
 - 必须将 `APP_SECRET` 改为强随机值（渠道凭证加密密钥由它派生；更推荐同时配置独立的 `CHANNEL_SECRET`);
 - 渠道凭证（bot token / secret)Fernet 加密落库，任何接口不回传明文；
 - 绑定管理权限：管理员或绑定创建者；员工挂载动作本身即"对该渠道全部用户开放该员工",请按需授权。
+
+## 开放 API
+
+外部业务系统可以通过员工级 API Key 调用数字员工、持续会话、Harness v2 Run、SOP、知识、技能、工具和定时任务。完整的鉴权边界、接口清单、SSE、Webhook 与调用示例见 [数字员工开放 API v1](docs/open-api-v1.md)。
 
 ## 项目结构
 

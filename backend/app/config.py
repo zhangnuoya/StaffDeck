@@ -20,10 +20,13 @@ class Settings(BaseSettings):
     general_skill_runtime_python: str = ""
     general_skill_runtime_venv: str = ""
     general_skill_runtime_packages: str = "requests,httpx"
+    # Keep runtime dependency installation enabled so published skills can
+    # provision their declared baseline libraries on first use. Deployments
+    # can still disable it explicitly for locked-down environments.
     general_skill_runtime_auto_install: bool = True
     general_skill_pip_index_url: str = ""
     general_skill_pip_timeout_seconds: int = 180
-    general_skill_network_install: bool = False
+    general_skill_network_install: bool = True
     # 外部 agent 运行时（Codex 等）：首期要求用户本机已安装对应 CLI。
     codex_cli_path: str = ""
     codex_default_model: str = ""
@@ -37,6 +40,12 @@ class Settings(BaseSettings):
     wechat_ilink_base_url: str = "https://ilinkai.weixin.qq.com"
     channel_delivery_poll_seconds: float = 1.0
     channel_delivery_max_attempts: int = 8
+    public_api_enabled: bool = True
+    public_api_key_pepper: str = ""
+    public_api_idempotency_ttl_seconds: int = 60 * 60 * 24
+    public_api_retention_days: int = 30
+    public_api_webhook_timeout_seconds: float = 10.0
+    public_api_webhook_max_attempts: int = 6
     # 钉钉 emotion 接口的表情常量与所需权限尚未真机验证，验证通过前默认关闭：
     # 否则常量失效或权限未开时，每条入站消息都会留下一条失败的 reaction 投递。
     channel_dingtalk_reaction_enabled: bool = False

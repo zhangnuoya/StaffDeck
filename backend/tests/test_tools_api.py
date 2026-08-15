@@ -1,8 +1,9 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
-import pytest
 import httpx
+import pytest
 from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -15,10 +16,13 @@ from app.api.tools import (
     _tool_config,
     delete_tool,
     list_tools,
+)
+from app.api.tools import (
     probe_tool as _probe_tool,
 )
 from app.config import get_settings
 from app.db.models import AgentProfile, AgentResourceBinding, Tenant, Tool, User
+from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
 from app.tools.tool_schema import ToolExecutionPolicy, ToolProbeRequest
 
 
@@ -288,6 +292,14 @@ def test_invalid_agent_id_does_not_fall_back_to_open_gallery_tools() -> None:
 
 
 def test_probe_tool_success_infers_output_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.api.tools.get_settings",
+        lambda: SimpleNamespace(
+            normalized_tool_base_url="http://localhost:5173",
+            tool_timeout_seconds=30.0,
+        ),
+    )
+
     class FakeClient:
         def __init__(self, *args, **kwargs):
             pass
@@ -301,6 +313,7 @@ def test_probe_tool_success_infers_output_schema(monkeypatch: pytest.MonkeyPatch
         def request(self, method, url, headers=None, json=None, params=None):
             assert method == "POST"
             assert url == "http://localhost:5173/api/mock/member/benefit-reconcile"
+            assert headers[INTERNAL_SERVICE_HEADER] == internal_service_token()
             assert json == {"user_id": "user_demo", "order_id": "A12345"}
             return httpx.Response(
                 200,
@@ -330,6 +343,50 @@ def test_probe_tool_success_infers_output_schema(monkeypatch: pytest.MonkeyPatch
         assert result.status_code == 200
         assert result.inferred_output_schema["properties"]["found"]["type"] == "boolean"
         assert result.inferred_output_schema["properties"]["missing_benefits"]["type"] == "array"
+
+
+def test_probe_tool_forwards_custom_auth_json_as_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    requested: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def request(self, method, url, headers=None, json=None, params=None):
+            requested.update(headers=headers, json=json)
+            return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        result = probe_tool(
+            ToolProbeRequest(
+                tenant_id="tenant_demo",
+                name="vendor.lookup",
+                method="POST",
+                url="https://vendor.example.test/lookup",
+                headers={"Content-Type": "application/json"},
+                auth={"X-API-Key": "api-key", "Authorization": "Token vendor-token"},
+                sample_arguments={"query": "staff"},
+            ),
+            db,
+        )
+
+    assert result.success is True
+    assert requested["headers"] == {
+        "Content-Type": "application/json",
+        "X-API-Key": "api-key",
+        "Authorization": "Token vendor-token",
+    }
+    assert requested["json"] == {"query": "staff"}
 
 
 def test_probe_mcp_tool_success_infers_output_schema() -> None:

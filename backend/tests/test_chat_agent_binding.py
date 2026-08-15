@@ -6,30 +6,34 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.api import chat as chat_api
+from app.agents.branching import agent_private_metadata
 from app.api.chat import (
     _bind_request_to_session_agent,
     _ensure_chat_agent_available,
     _user_message_metadata,
     create_chat_session,
+    list_slash_commands,
     list_chat_sessions,
 )
-from app.agents.branching import ensure_private_resource_binding
 from app.core.agent_loop import AgentLoop, AgentLoopPreconditionError
 from app.db.models import (
     AgentEvent,
     AgentProfile,
+    AgentResourceBinding,
     ChatSession,
+    ExternalSessionBinding,
+    GeneralSkill,
     Message,
     ModelConfig,
     PersonaConfig,
     ScheduledTaskRun,
+    Skill,
     Tenant,
     Tool,
     User,
     utc_now,
 )
 from app.session.session_schema import ChatSessionCreateRequest, ChatTurnRequest
-from app.tools.tool_schema import ToolCall
 
 
 def test_existing_chat_session_cannot_switch_agent() -> None:
@@ -96,6 +100,91 @@ def test_chat_agent_must_be_active_non_overall_agent() -> None:
         assert missing.value.status_code == 400
         assert overall.value.status_code == 404
         assert archived.value.status_code == 404
+
+
+def test_chat_slash_commands_only_list_bound_executable_resources() -> None:
+    with _test_session() as db:
+        current_user = User(
+            id="user_demo", tenant_id="tenant_demo", username="demo", password_hash="x"
+        )
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(current_user)
+        db.add(
+            AgentProfile(
+                id="agent_demo",
+                tenant_id="tenant_demo",
+                name="客服",
+                is_overall=False,
+                metadata_json={"owner_user_id": current_user.id},
+            )
+        )
+        sop = Skill(
+            tenant_id="tenant_demo",
+            skill_id="refund_v1",
+            name="退款流程",
+            status="published",
+            content_json={"start_node_id": "start", "nodes": [{"node_id": "start"}]},
+        )
+        general_skill = GeneralSkill(
+            tenant_id="tenant_demo",
+            slug="weather",
+            name="天气查询",
+            status="published",
+            capability_scope="general",
+            skill_markdown="# Weather",
+        )
+        hidden_skill = GeneralSkill(
+            tenant_id="tenant_demo",
+            slug="sop-only",
+            name="仅 SOP 技能",
+            status="published",
+            capability_scope="sop_specific",
+            skill_markdown="# SOP only",
+        )
+        tool = Tool(
+            tenant_id="tenant_demo",
+            name="price_query",
+            display_name="价格查询",
+            method="GET",
+            url="https://example.test/prices",
+            enabled=True,
+            capability_scope="general",
+        )
+        db.add(sop)
+        db.add(general_skill)
+        db.add(hidden_skill)
+        db.add(tool)
+        db.flush()
+        for resource_type, resource_id in (
+            ("skill", sop.id),
+            ("general_skill", general_skill.id),
+            ("general_skill", hidden_skill.id),
+            ("tool", tool.id),
+        ):
+            db.add(
+                AgentResourceBinding(
+                    tenant_id="tenant_demo",
+                    agent_id="agent_demo",
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    status="active",
+                    metadata_json=agent_private_metadata("agent_demo"),
+                )
+            )
+        db.commit()
+
+        rows = list_slash_commands(
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+            current_user=current_user,
+            db=db,
+        )
+
+        assert {(row.kind, row.target) for row in rows} == {
+            ("sop", "refund_v1"),
+            ("skill", "weather"),
+            ("tool", "price_query"),
+        }
 
 
 def test_create_chat_session_always_creates_new_agent_session() -> None:
@@ -184,6 +273,87 @@ def test_chat_session_list_exposes_scheduled_origin_without_title_inference() ->
 
         assert by_id["session_normal"].is_scheduled is False
         assert by_id["session_scheduled"].is_scheduled is True
+
+
+def test_chat_session_list_hides_pilotdeck_sessions_from_all_supported_origins() -> None:
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        current_user = User(
+            id="user_demo", tenant_id="tenant_demo", username="demo", password_hash="x"
+        )
+        db.add(current_user)
+        db.add_all(
+            [
+                ChatSession(
+                    id="session_visible",
+                    tenant_id="tenant_demo",
+                    user_id=current_user.id,
+                    title="普通对话",
+                ),
+                ChatSession(
+                    id="session_pilotdeck_api",
+                    tenant_id="tenant_demo",
+                    user_id=current_user.id,
+                    title="PilotDeck API",
+                    channel="public_api",
+                ),
+                ChatSession(
+                    id="session_pilotdeck_legacy",
+                    tenant_id="tenant_demo",
+                    user_id=current_user.id,
+                    title="PilotDeck Legacy",
+                    channel="pilotdeck_group_chat",
+                ),
+                ChatSession(
+                    id="session_pilotdeck_event",
+                    tenant_id="tenant_demo",
+                    user_id=current_user.id,
+                    title="PilotDeck Event",
+                ),
+            ]
+        )
+        db.add(
+            ExternalSessionBinding(
+                tenant_id="tenant_demo",
+                credential_id="credential_pilotdeck",
+                agent_id="agent_demo",
+                external_session_id="pilotdeck-room-1",
+                session_id="session_pilotdeck_api",
+                metadata_json={"channel": "pilotdeck_group_chat"},
+            )
+        )
+        db.add(
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id="session_pilotdeck_event",
+                event_type="user_message_received",
+                payload_json={"channel": "pilotdeck_group_chat"},
+            )
+        )
+        db.commit()
+
+        rows = list_chat_sessions("tenant_demo", current_user=current_user, db=db)
+
+        assert [row.id for row in rows] == ["session_visible"]
+        assert db.get(ChatSession, "session_pilotdeck_api") is not None
+        assert db.get(ChatSession, "session_pilotdeck_legacy") is not None
+        assert db.get(ChatSession, "session_pilotdeck_event") is not None
+
+
+def test_agent_loop_persists_pilotdeck_origin_on_legacy_session() -> None:
+    with _test_session() as db:
+        loop = AgentLoop(db)
+        session = loop._get_or_create_session(
+            ChatTurnRequest(
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                agent_id="agent_demo",
+                message="请处理",
+                channel="pilotdeck_group_chat",
+            )
+        )
+
+        assert session.channel == "pilotdeck_group_chat"
 
 
 def test_session_title_summary_uses_first_user_message_when_title_empty(monkeypatch) -> None:
@@ -316,92 +486,6 @@ def test_chat_turn_can_select_enabled_model_config() -> None:
 
         assert model is not None
         assert model.id == "model_selected"
-
-
-def test_agent_loop_only_exposes_tools_bound_to_current_employee() -> None:
-    with _test_session() as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
-        agent_a = AgentProfile(id="agent_a", tenant_id="tenant_demo", name="员工 A")
-        agent_b = AgentProfile(id="agent_b", tenant_id="tenant_demo", name="员工 B")
-        tool_a = Tool(
-            id="tool_a",
-            tenant_id="tenant_demo",
-            name="tool.a",
-            method="POST",
-            url="https://example.test/a",
-            enabled=True,
-        )
-        tool_b = Tool(
-            id="tool_b",
-            tenant_id="tenant_demo",
-            name="tool.b",
-            method="POST",
-            url="https://example.test/b",
-            enabled=True,
-        )
-        db.add(agent_a)
-        db.add(agent_b)
-        db.add(tool_a)
-        db.add(tool_b)
-        db.flush()
-        ensure_private_resource_binding(db, "tenant_demo", agent_a.id, "tool", tool_a.id, "active")
-        ensure_private_resource_binding(db, "tenant_demo", agent_b.id, "tool", tool_b.id, "active")
-        db.commit()
-
-        loop = AgentLoop(db)
-
-        assert [row.id for row in loop._list_enabled_tools("tenant_demo", agent_a.id)] == [
-            tool_a.id
-        ]
-        assert [row.id for row in loop._list_enabled_tools("tenant_demo", agent_b.id)] == [
-            tool_b.id
-        ]
-
-
-def test_agent_loop_rejects_unbound_tool_before_execution_or_replay() -> None:
-    with _test_session() as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
-        owner = AgentProfile(id="agent_owner", tenant_id="tenant_demo", name="员工 A")
-        other = AgentProfile(id="agent_other", tenant_id="tenant_demo", name="员工 B")
-        tool = Tool(
-            id="tool_private",
-            tenant_id="tenant_demo",
-            name="private.lookup",
-            method="POST",
-            url="https://example.test/private",
-            enabled=True,
-        )
-        session = ChatSession(
-            id="session_other",
-            tenant_id="tenant_demo",
-            user_id="user_demo",
-            agent_id=other.id,
-        )
-        db.add(owner)
-        db.add(other)
-        db.add(tool)
-        db.add(session)
-        db.flush()
-        ensure_private_resource_binding(db, "tenant_demo", owner.id, "tool", tool.id, "active")
-        db.commit()
-
-        result = AgentLoop(db)._execute_tool_call(
-            ChatTurnRequest(
-                tenant_id="tenant_demo",
-                session_id=session.id,
-                user_id="user_demo",
-                agent_id=other.id,
-                message="执行私有工具",
-            ),
-            session,
-            ToolCall(name=tool.name, arguments={}),
-        )
-
-        assert result.success is False
-        assert result.error is not None
-        assert result.error.code == "NOT_ALLOWED"
-        event_types = [row.event_type for row in db.exec(select(AgentEvent)).all()]
-        assert event_types == ["tool_call_started", "tool_call_finished"]
 
 
 def test_chat_turn_rejects_disabled_selected_model_config() -> None:

@@ -9,6 +9,7 @@ import type {
   ChatMessage,
   ChatSession,
   ChatSessionEventRead,
+  HarnessWorkspaceArtifact,
   KnowledgeCitation,
   ScheduledTaskDraftRead,
   ScheduledTaskRead,
@@ -177,7 +178,15 @@ function renderBareLinks(text: string, keyPrefix: string): ReactNode[] {
   return nodes;
 }
 
-export function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
+export type MarkdownRenderOptions = {
+  renderInternalLink?: (link: { label: string; href: string; key: string }) => ReactNode;
+};
+
+export function renderInlineMarkdown(
+  text: string,
+  keyPrefix: string,
+  options: MarkdownRenderOptions = {},
+): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /(`[^`]*`|\*\*[^*]+?\*\*|!?\[[^\]\n]*\]\([^\)\n]+\))/g;
   let cursor = 0;
@@ -193,7 +202,7 @@ export function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode
     if (token.startsWith('`') && token.endsWith('`')) {
       nodes.push(<code key={key}>{token.slice(1, -1)}</code>);
     } else if (token.startsWith('**') && token.endsWith('**')) {
-      nodes.push(<strong key={key}>{renderInlineMarkdown(token.slice(2, -2), key)}</strong>);
+      nodes.push(<strong key={key}>{renderInlineMarkdown(token.slice(2, -2), key, options)}</strong>);
     } else {
       const image = token.match(/^!\[([^\]]*)\]\(([^\)\n]+)\)$/);
       if (image) {
@@ -212,6 +221,8 @@ export function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode
               {label}
             </a>,
           );
+        } else if (options.renderInternalLink) {
+          nodes.push(options.renderInternalLink({ label, href, key }));
         } else {
           nodes.push(
             <span key={key} className="md-link-label" title={href}>
@@ -244,10 +255,15 @@ function softLineBreakSeparator(previousLine: string, currentLine: string): stri
   return cjkCharacter.test(previousCharacter) || cjkCharacter.test(currentCharacter) ? '' : ' ';
 }
 
-function renderInlineLines(lines: string[], keyPrefix: string, preserveLineBreaks: boolean): ReactNode[] {
+function renderInlineLines(
+  lines: string[],
+  keyPrefix: string,
+  preserveLineBreaks: boolean,
+  options: MarkdownRenderOptions,
+): ReactNode[] {
   return lines.flatMap((line, lineIndex) => {
     const renderedLine = preserveLineBreaks ? line : line.trim();
-    const nodes = renderInlineMarkdown(renderedLine, `${keyPrefix}-line-${lineIndex}`);
+    const nodes = renderInlineMarkdown(renderedLine, `${keyPrefix}-line-${lineIndex}`, options);
     if (lineIndex === 0) return nodes;
     const separator = preserveLineBreaks
       ? <br key={`${keyPrefix}-br-${lineIndex}`} />
@@ -308,7 +324,12 @@ function isMarkdownTableStart(lines: string[], index: number): boolean {
   return splitMarkdownTableRow(header).length >= 2 && isMarkdownTableSeparator(lines[index + 1]);
 }
 
-function renderMarkdownTable(lines: string[], startIndex: number, key: string): { node: ReactNode; nextIndex: number } {
+function renderMarkdownTable(
+  lines: string[],
+  startIndex: number,
+  key: string,
+  options: MarkdownRenderOptions,
+): { node: ReactNode; nextIndex: number } {
   const header = splitMarkdownTableRow(lines[startIndex]);
   const separator = splitMarkdownTableRow(lines[startIndex + 1]);
   const aligns = separator.map(markdownTableAlign);
@@ -329,7 +350,7 @@ function renderMarkdownTable(lines: string[], startIndex: number, key: string): 
   const renderCells = (cells: string[], rowKey: string) =>
     Array.from({ length: columnCount }, (_, cellIndex) => (
       <td key={`${rowKey}-${cellIndex}`} style={cellStyle(cellIndex)}>
-        {renderInlineMarkdown(cells[cellIndex] || '', `${rowKey}-${cellIndex}`)}
+        {renderInlineMarkdown(cells[cellIndex] || '', `${rowKey}-${cellIndex}`, options)}
       </td>
     ));
 
@@ -342,7 +363,7 @@ function renderMarkdownTable(lines: string[], startIndex: number, key: string): 
             <tr>
               {Array.from({ length: columnCount }, (_, cellIndex) => (
                 <th key={`${key}-head-${cellIndex}`} style={cellStyle(cellIndex)}>
-                  {renderInlineMarkdown(header[cellIndex] || '', `${key}-head-${cellIndex}`)}
+                  {renderInlineMarkdown(header[cellIndex] || '', `${key}-head-${cellIndex}`, options)}
                 </th>
               ))}
             </tr>
@@ -370,11 +391,20 @@ function isBlockBoundary(line: string): boolean {
   );
 }
 
-export function renderMarkdownBlocks(content: string, preserveLineBreaks = true): ReactNode[] {
+export function renderMarkdownBlocks(
+  content: string,
+  preserveLineBreaks = true,
+  options: MarkdownRenderOptions = {},
+): ReactNode[] {
   const lines = content.replace(/\r\n/g, '\n').split('\n');
   const blocks: ReactNode[] = [];
   let index = 0;
   let blockIndex = 0;
+  let continuedOrderedListStart: number | null = null;
+
+  const resetOrderedListSequence = () => {
+    continuedOrderedListStart = null;
+  };
 
   while (index < lines.length) {
     const line = lines[index];
@@ -386,6 +416,7 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
     }
 
     if (trimmed.startsWith('```')) {
+      resetOrderedListSequence();
       const language = trimmed.slice(3).trim();
       const codeLines: string[] = [];
       index += 1;
@@ -402,6 +433,7 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
     }
 
     if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      resetOrderedListSequence();
       blocks.push(<hr key={key} />);
       index += 1;
       blockIndex += 1;
@@ -410,27 +442,34 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
 
     const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
+      resetOrderedListSequence();
       const level = Math.min(heading[1].length, 4) as 1 | 2 | 3 | 4;
       const Tag = `h${level}` as keyof JSX.IntrinsicElements;
-      blocks.push(<Tag key={key}>{renderInlineMarkdown(heading[2], key)}</Tag>);
+      blocks.push(<Tag key={key}>{renderInlineMarkdown(heading[2], key, options)}</Tag>);
       index += 1;
       blockIndex += 1;
       continue;
     }
 
     if (/^>\s?/.test(trimmed)) {
+      resetOrderedListSequence();
       const quoteLines: string[] = [];
       while (index < lines.length && /^>\s?/.test(lines[index].trim())) {
         quoteLines.push(lines[index].trim().replace(/^>\s?/, ''));
         index += 1;
       }
-      blocks.push(<blockquote key={key}>{renderMarkdownBlocks(quoteLines.join('\n'), preserveLineBreaks)}</blockquote>);
+      blocks.push(
+        <blockquote key={key}>
+          {renderMarkdownBlocks(quoteLines.join('\n'), preserveLineBreaks, options)}
+        </blockquote>,
+      );
       blockIndex += 1;
       continue;
     }
 
     if (isMarkdownTableStart(lines, index)) {
-      const table = renderMarkdownTable(lines, index, key);
+      resetOrderedListSequence();
+      const table = renderMarkdownTable(lines, index, key, options);
       blocks.push(table.node);
       index = table.nextIndex;
       blockIndex += 1;
@@ -446,7 +485,9 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
       blocks.push(
         <ul key={key}>
           {items.map((item, itemIndex) => (
-            <li key={`${key}-${itemIndex}`}>{renderInlineMarkdown(item, `${key}-${itemIndex}`)}</li>
+            <li key={`${key}-${itemIndex}`}>
+              {renderInlineMarkdown(item, `${key}-${itemIndex}`, options)}
+            </li>
           ))}
         </ul>,
       );
@@ -455,22 +496,32 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
     }
 
     if (/^\d+[.)]\s+/.test(trimmed)) {
-      const items: string[] = [];
+      const items: Array<{ marker: number; content: string }> = [];
       while (index < lines.length && /^\d+[.)]\s+/.test(lines[index].trim())) {
-        items.push(lines[index].trim().replace(/^\d+[.)]\s+/, ''));
+        const item = lines[index].trim().match(/^(\d+)[.)]\s+(.+)$/);
+        if (!item) break;
+        items.push({ marker: Number(item[1]), content: item[2] });
         index += 1;
       }
+      const explicitStart = items[0]?.marker || 1;
+      const listStart: number = explicitStart === 1 && continuedOrderedListStart !== null
+        ? continuedOrderedListStart
+        : explicitStart;
       blocks.push(
-        <ol key={key}>
+        <ol key={key} start={listStart === 1 ? undefined : listStart}>
           {items.map((item, itemIndex) => (
-            <li key={`${key}-${itemIndex}`}>{renderInlineMarkdown(item, `${key}-${itemIndex}`)}</li>
+            <li key={`${key}-${itemIndex}`}>
+              {renderInlineMarkdown(item.content, `${key}-${itemIndex}`, options)}
+            </li>
           ))}
         </ol>,
       );
+      continuedOrderedListStart = listStart + items.length;
       blockIndex += 1;
       continue;
     }
 
+    resetOrderedListSequence();
     const paragraphLines: string[] = [];
     while (
       index < lines.length &&
@@ -481,7 +532,9 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
       paragraphLines.push(lines[index]);
       index += 1;
     }
-    blocks.push(<p key={key}>{renderInlineLines(paragraphLines, key, preserveLineBreaks)}</p>);
+    blocks.push(
+      <p key={key}>{renderInlineLines(paragraphLines, key, preserveLineBreaks, options)}</p>,
+    );
     blockIndex += 1;
   }
 
@@ -1304,7 +1357,7 @@ export function mergeTurnTraceSnapshot(existing: TurnTrace | undefined, incoming
   };
 }
 
-function formatTracePayload(value: unknown): string {
+export function formatTracePayload(value: unknown): string {
   if (value === undefined || value === null || value === '') return '';
   if (typeof value === 'string') {
     try {
@@ -1329,6 +1382,144 @@ function tracePayloadLanguage(value: string): string {
     return 'text';
   }
 }
+
+
+export function harnessEventTraceLine(
+  eventName: string,
+  data: Record<string, unknown>,
+): TraceLine | null {
+  const frameId = typeof data.task_frame_id === 'string' && data.task_frame_id.trim()
+    ? data.task_frame_id.trim()
+    : 'current';
+  const iteration = typeof data.iteration === 'number' || typeof data.iteration === 'string'
+    ? String(data.iteration)
+    : '';
+  const toolName = typeof data.tool_name === 'string' ? data.tool_name.trim() : '';
+
+  if (eventName === 'task_frame_started') {
+    const kind = typeof data.kind === 'string' ? data.kind : 'conversation';
+    const stepId = typeof data.step_id === 'string' ? data.step_id.trim() : '';
+    return {
+      id: `harness_frame_${frameId}`,
+      kind: kind === 'sop' ? 'skill' : 'decision',
+      text: '开始执行任务',
+      detail: [
+        kind === 'sop' ? 'SOP TaskFrame' : '对话 TaskFrame',
+        stepId ? `步骤 ${stepId}` : '',
+        typeof data.step_timeout_seconds === 'number'
+          ? `单步上限 ${data.step_timeout_seconds} 秒`
+          : '',
+        typeof data.harness_max_actions === 'number'
+          ? `Harness 最多 ${data.harness_max_actions} 轮`
+          : '',
+      ]
+        .filter(Boolean)
+        .join(' · '),
+      state: 'running',
+      icon: kind === 'sop' ? 'advance' : 'execute',
+    };
+  }
+  if (eventName === 'harness_step_timeout') {
+    const timeoutSeconds = typeof data.timeout_seconds === 'number' ? data.timeout_seconds : undefined;
+    const actionCount = typeof data.action_count === 'number' ? data.action_count : undefined;
+    return {
+      id: `harness_timeout_${frameId}`,
+      kind: 'skill',
+      text: 'SOP 单步运行超时',
+      detail: [
+        timeoutSeconds === undefined ? '' : `上限 ${timeoutSeconds} 秒`,
+        actionCount === undefined ? '' : `已执行 ${actionCount} 个动作`,
+      ].filter(Boolean).join(' · '),
+      state: 'failed',
+      icon: 'loading',
+    };
+  }
+  if (eventName === 'task_frame_finished') {
+    const status = typeof data.status === 'string' ? data.status : 'completed';
+    const failed = ['failed', 'blocked', 'cancelled'].includes(status);
+    const actionCount = typeof data.action_count === 'number' ? data.action_count : undefined;
+    return {
+      id: `harness_frame_${frameId}`,
+      kind: 'decision',
+      text: failed ? '任务执行失败' : '任务执行完成',
+      detail: [`状态 ${status}`, actionCount === undefined ? '' : `执行 ${actionCount} 个动作`]
+        .filter(Boolean)
+        .join(' · '),
+      state: failed ? 'failed' : 'completed',
+      icon: failed ? 'loading' : 'execute',
+    };
+  }
+  if (eventName === 'harness_action_created') {
+    const action = typeof data.action === 'string' ? data.action : '';
+    if (action === 'tool') {
+      return {
+        id: `harness_action_${frameId}_${iteration || 'current'}`,
+        kind: 'tool',
+        text: toolName ? `调用能力 ${toolName}` : '调用能力',
+        detail: iteration ? `第 ${iteration} 个动作` : undefined,
+        state: 'running',
+        icon: 'tool',
+      };
+    }
+    if (action === 'finish') {
+      return {
+        id: `harness_finish_${frameId}_${iteration || 'current'}`,
+        kind: 'decision',
+        text: '整理任务结果',
+        detail: iteration ? `第 ${iteration} 个动作` : undefined,
+        state: 'completed',
+        icon: 'advance',
+      };
+    }
+    return null;
+  }
+  if (eventName === 'harness_mcp_app_view') {
+    const mcpApp = isPlainRecord(data.mcp_app)
+      ? data.mcp_app as TraceLine['mcpApp']
+      : undefined;
+    if (!mcpApp) return null;
+    const appToolName = typeof data.tool_name === 'string' ? data.tool_name : mcpApp.tool_name;
+    return {
+      id: `harness_mcp_app_${frameId}_${appToolName || 'view'}`,
+      kind: 'tool',
+      text: appToolName ? `展示 MCP App ${appToolName}` : '展示 MCP App',
+      detail: '隔离视图；加载失败时保留文本结果',
+      mcpApp,
+      state: 'completed',
+      icon: 'tool',
+    };
+  }
+  if (eventName === 'harness_tool_completed') {
+    const success = data.success === true;
+    const result = isPlainRecord(data.result) ? data.result : {};
+    const mcpApp = isPlainRecord(result.mcp_app)
+      ? result.mcp_app as TraceLine['mcpApp']
+      : undefined;
+    const error = isPlainRecord(data.error) ? data.error : {};
+    const detail = [
+      typeof error.code === 'string' ? error.code : '',
+      typeof error.message === 'string' ? error.message : '',
+    ].filter(Boolean).join(' · ') || undefined;
+    const output = formatTracePayload(data.result);
+    return {
+      id: `harness_action_${frameId}_${iteration || 'current'}`,
+      kind: 'tool',
+      text: toolName
+        ? `${success ? '能力调用完成' : '能力调用失败'} ${toolName}`
+        : success ? '能力调用完成' : '能力调用失败',
+      detail,
+      output: output || undefined,
+      outputLanguage: output ? tracePayloadLanguage(output) : undefined,
+      outputTitle: output ? '查看能力结果' : undefined,
+      collapsible: Boolean(output),
+      mcpApp,
+      state: success ? 'completed' : 'failed',
+      icon: 'tool',
+    };
+  }
+  return null;
+}
+
 
 export function generalSkillTraceDetail(data: Record<string, unknown>, phase: string): string | undefined {
   const review = isPlainRecord(data.review) ? data.review : undefined;
@@ -1787,6 +1978,59 @@ export function messageAttachments(messageItem: ChatMessage): ChatAttachmentRead
   const attachments = messageItem.metadata?.attachments;
   if (!Array.isArray(attachments)) return [];
   return attachments.filter(isChatAttachment);
+}
+
+export function harnessWorkspaceArtifacts(
+  messageItem: ChatMessage,
+): HarnessWorkspaceArtifact[] {
+  const artifacts = messageItem.metadata?.harness_artifacts;
+  if (!Array.isArray(artifacts)) return [];
+  const seen = new Set<string>();
+  const result: HarnessWorkspaceArtifact[] = [];
+  artifacts.forEach((value) => {
+    if (!value || typeof value !== 'object') return;
+    const artifact = value as Partial<HarnessWorkspaceArtifact>;
+    if (
+      artifact.type !== 'workspace_file'
+      || typeof artifact.task_frame_id !== 'string'
+      || !artifact.task_frame_id.trim()
+      || typeof artifact.path !== 'string'
+      || !artifact.path.trim()
+    ) {
+      return;
+    }
+    const identity = `${artifact.task_frame_id}\u001f${artifact.path}`;
+    if (seen.has(identity)) return;
+    seen.add(identity);
+    result.push({
+      type: 'workspace_file',
+      task_frame_id: artifact.task_frame_id,
+      path: artifact.path,
+      ...(typeof artifact.sandbox_path === 'string'
+        ? { sandbox_path: artifact.sandbox_path }
+        : {}),
+      ...(typeof artifact.sha256 === 'string' ? { sha256: artifact.sha256 } : {}),
+      ...(typeof artifact.size === 'number' && Number.isFinite(artifact.size)
+        ? { size: artifact.size }
+        : {}),
+      ...(typeof artifact.display_name === 'string'
+        ? { display_name: artifact.display_name }
+        : {}),
+      ...(typeof artifact.description === 'string'
+        ? { description: artifact.description }
+        : {}),
+      ...(typeof artifact.content_type === 'string'
+        ? { content_type: artifact.content_type }
+        : {}),
+      ...(typeof artifact.operation === 'string'
+        ? { operation: artifact.operation }
+        : {}),
+      ...(typeof artifact.source === 'string'
+        ? { source: artifact.source }
+        : {}),
+    });
+  });
+  return result;
 }
 
 function isChatAttachment(value: unknown): value is ChatAttachmentRead {

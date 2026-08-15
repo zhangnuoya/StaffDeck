@@ -4,12 +4,14 @@ import base64
 import csv
 import io
 import json
+import hashlib
 import mimetypes
 import re
 from collections.abc import Iterable
 from typing import Any
 
 from app.db.models import new_id
+from app.session.attachment_store import sandbox_attachment_path
 from app.session.session_schema import ChatAttachmentRead
 
 
@@ -42,7 +44,13 @@ TEXT_EXTENSIONS = {
 }
 
 
-def parse_chat_attachment(filename: str, content_type: str | None, data: bytes) -> ChatAttachmentRead:
+def parse_chat_attachment(
+    filename: str,
+    content_type: str | None,
+    data: bytes,
+    *,
+    extract_text: bool = True,
+) -> ChatAttachmentRead:
     safe_name = _safe_filename(filename)
     detected_type = content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
     lower_name = safe_name.lower()
@@ -50,18 +58,14 @@ def parse_chat_attachment(filename: str, content_type: str | None, data: bytes) 
         detected_type = _image_content_type_for(lower_name, detected_type)
         return _image_attachment(safe_name, detected_type, data)
     if lower_name.endswith(".pdf") or detected_type == "application/pdf":
+        if not extract_text:
+            return _path_only_attachment(safe_name, detected_type, data, kind="pdf")
         return _pdf_attachment(safe_name, detected_type, data)
     if _is_text_file(lower_name, detected_type):
+        if not extract_text:
+            return _path_only_attachment(safe_name, detected_type, data, kind="text")
         return _text_attachment(safe_name, detected_type, data)
-    return ChatAttachmentRead(
-        id=new_id("file"),
-        filename=safe_name,
-        content_type=detected_type,
-        size=len(data),
-        kind="binary",
-        preview="暂不支持直接读取该二进制文件内容。",
-        python_summary=_python_file_summary(safe_name, detected_type, data, ""),
-    )
+    return _path_only_attachment(safe_name, detected_type, data, kind="binary")
 
 
 def attachment_context_lines(attachments: Iterable[ChatAttachmentRead | dict[str, Any]]) -> list[str]:
@@ -74,17 +78,13 @@ def attachment_context_lines(attachments: Iterable[ChatAttachmentRead | dict[str
     for index, attachment in enumerate(normalized, start=1):
         lines.append(
             f"{index}. 文件名：{attachment.filename}；类型：{attachment.kind}/{attachment.content_type}；"
-            f"大小：{attachment.size} bytes"
+            f"大小：{attachment.size} bytes；"
+            f"沙箱路径：{attachment.sandbox_path or sandbox_attachment_path(attachment, index)}"
         )
-        if attachment.python_summary:
-            lines.append(f"Python理解摘要：{attachment.python_summary}")
-        if attachment.text:
-            lines.append("可读取正文：")
-            lines.append(_trim_text(attachment.text, MAX_EXTRACTED_TEXT_CHARS))
-        elif attachment.preview:
-            lines.append(f"预览：{attachment.preview}")
-        elif attachment.kind == "image":
-            lines.append("图片附件已上传，可在前端消息中查看；如当前模型支持视觉输入，请结合图片内容回答。")
+        if attachment.kind == "image":
+            lines.append("图片同时作为本轮视觉输入提供；若模型不支持视觉输入，请读取沙箱文件。")
+        else:
+            lines.append("附件正文未预先抽取；需要内容时请使用文件工具读取沙箱文件。")
     return lines
 
 
@@ -132,6 +132,122 @@ def request_has_image_attachments(attachments: Iterable[ChatAttachmentRead | dic
     return any(bool(item and _attachment_is_supported_image(item)) for item in normalized)
 
 
+def validate_chat_turn_attachments(
+    attachments: list[ChatAttachmentRead],
+    *,
+    max_attachments: int,
+    max_attachment_bytes: int,
+) -> list[ChatAttachmentRead]:
+    """Validate and normalize the client round-trip from ``/attachments``.
+
+    The upload response is currently stateless, so every field returning on a
+    turn must be treated as untrusted user input.
+    """
+
+    if len(attachments) > max_attachments:
+        raise ValueError(f"最多携带 {max_attachments} 个附件")
+    normalized: list[ChatAttachmentRead] = []
+    for attachment in attachments:
+        filename = _safe_filename(attachment.filename)[:255]
+        content_type = str(attachment.content_type or "").strip()[:128]
+        size = int(attachment.size)
+        if size < 0 or size > max_attachment_bytes:
+            raise ValueError(f"{filename} 超过附件大小限制")
+        # The raw upload is authoritative. Never accept extracted text or previews
+        # round-tripped by the browser as model context.
+        text = None
+        preview = (
+            "图片附件"
+            if attachment.kind == "image"
+            else "文件已上传，请通过沙箱路径读取。"
+        )
+        data_url = _validated_image_data_url(
+            attachment,
+            filename=filename,
+            content_type=content_type,
+            size=size,
+        )
+        sha256 = str(attachment.sha256 or "").strip().lower() or None
+        if sha256 and not re.fullmatch(r"[a-f0-9]{64}", sha256):
+            raise ValueError(f"{filename} 的 SHA-256 无效")
+        sandbox_path = str(attachment.sandbox_path or "").strip() or None
+        if sandbox_path and sandbox_path != sandbox_attachment_path(
+            attachment.model_copy(update={"filename": filename})
+        ):
+            raise ValueError(f"{filename} 的沙箱路径无效")
+        normalized.append(
+            attachment.model_copy(
+                update={
+                    "filename": filename,
+                    "content_type": content_type,
+                    "size": size,
+                    "text": text,
+                    "preview": preview,
+                    "data_url": data_url,
+                    "sandbox_path": sandbox_path,
+                    "sha256": sha256,
+                    "python_summary": _round_trip_summary(
+                        filename,
+                        content_type,
+                        size,
+                        text,
+                    ),
+                    "error": str(attachment.error or "")[:2_000] or None,
+                }
+            )
+        )
+    return normalized
+
+
+def _validated_image_data_url(
+    attachment: ChatAttachmentRead,
+    *,
+    filename: str,
+    content_type: str,
+    size: int,
+) -> str | None:
+    raw = str(attachment.data_url or "").strip()
+    if not raw:
+        return None
+    if attachment.kind != "image" or not _is_supported_image_file(
+        filename.lower(),
+        content_type,
+    ):
+        raise ValueError(f"{filename} 不是受支持的图片附件")
+    prefix = f"data:{content_type};base64,"
+    if not raw.startswith(prefix):
+        raise ValueError(f"{filename} 的图片 data URL 无效")
+    encoded = raw.removeprefix(prefix)
+    if len(encoded) > ((IMAGE_DATA_URL_LIMIT_BYTES + 2) // 3) * 4:
+        raise ValueError(f"{filename} 的图片 data URL 超限")
+    try:
+        decoded = base64.b64decode(
+            encoded,
+            validate=True,
+        )
+    except Exception as exc:
+        raise ValueError(f"{filename} 的图片 data URL 无效") from exc
+    if len(decoded) > IMAGE_DATA_URL_LIMIT_BYTES or len(decoded) != size:
+        raise ValueError(f"{filename} 的图片 data URL 大小不一致或超限")
+    if attachment.sha256 and hashlib.sha256(decoded).hexdigest() != attachment.sha256.lower():
+        raise ValueError(f"{filename} 的图片 data URL 与上传文件不一致")
+    return raw
+
+
+def _round_trip_summary(
+    filename: str,
+    content_type: str,
+    size: int,
+    text: str | None,
+) -> str:
+    return _python_file_summary_from_size(
+        filename,
+        content_type,
+        size,
+        text or "",
+    )
+
+
 def _text_attachment(filename: str, content_type: str, data: bytes) -> ChatAttachmentRead:
     text = _decode_text(data)
     trimmed = _trim_text(text, MAX_EXTRACTED_TEXT_CHARS)
@@ -144,6 +260,24 @@ def _text_attachment(filename: str, content_type: str, data: bytes) -> ChatAttac
         text=trimmed,
         preview=_trim_text(trimmed, MAX_PREVIEW_CHARS),
         python_summary=_python_file_summary(filename, content_type, data, trimmed),
+    )
+
+
+def _path_only_attachment(
+    filename: str,
+    content_type: str,
+    data: bytes,
+    *,
+    kind: str,
+) -> ChatAttachmentRead:
+    return ChatAttachmentRead(
+        id=new_id("file"),
+        filename=filename,
+        content_type=content_type,
+        size=len(data),
+        kind=kind,
+        preview="文件已上传，请通过沙箱路径读取。",
+        python_summary=_python_file_summary(filename, content_type, data, ""),
     )
 
 
@@ -194,7 +328,21 @@ def _image_attachment(filename: str, content_type: str, data: bytes) -> ChatAtta
 
 
 def _python_file_summary(filename: str, content_type: str, data: bytes, text: str) -> str:
-    parts = [f"文件 {filename}，{len(data)} bytes，MIME {content_type}。"]
+    return _python_file_summary_from_size(
+        filename,
+        content_type,
+        len(data),
+        text,
+    )
+
+
+def _python_file_summary_from_size(
+    filename: str,
+    content_type: str,
+    size: int,
+    text: str,
+) -> str:
+    parts = [f"文件 {filename}，{size} bytes，MIME {content_type}。"]
     if text:
         lines = text.splitlines()
         words = re.findall(r"\S+", text)

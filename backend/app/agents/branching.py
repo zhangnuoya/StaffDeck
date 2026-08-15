@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Iterable
+from typing import Any
 
 from sqlmodel import Session, select
 
 from app.db.models import (
     AgentKnowledgeBranch,
-    AgentModelBinding,
     AgentProfile,
     AgentResourceBinding,
     AgentSkillBranch,
@@ -20,6 +19,7 @@ from app.db.models import (
     KnowledgeConcept,
     KnowledgeDiscoverySuggestion,
     KnowledgeDocument,
+    MCPServer,
     ModelConfig,
     Skill,
     SkillVersion,
@@ -480,7 +480,7 @@ def visible_tool_rows(
             row
             for row in rows
             if is_open_gallery_resource(db, tenant_id, "tool", row)
-            and (include_inactive or row.enabled)
+            and (include_inactive or _tool_runtime_enabled(db, row))
         ]
 
     bindings = db.exec(
@@ -502,10 +502,23 @@ def visible_tool_rows(
             continue
         if not is_bound_resource_visible_for_agent(db, tenant_id, "tool", row, binding):
             continue
-        if not include_inactive and not row.enabled:
+        if not include_inactive and not _tool_runtime_enabled(db, row):
             continue
         visible.append(row)
     return sorted(visible, key=lambda row: (row.bucket, row.name))
+
+
+def _tool_runtime_enabled(db: Session, row: Tool) -> bool:
+    if not row.enabled:
+        return False
+    if not row.mcp_server_id:
+        return True
+    server = db.get(MCPServer, row.mcp_server_id)
+    return bool(
+        server
+        and server.tenant_id == row.tenant_id
+        and server.enabled
+    )
 
 
 def ensure_agent_skill_branch(
@@ -790,6 +803,7 @@ def ensure_knowledge_base_version(
         name=kb.name,
         description=kb.description,
         status=kb.status,
+        capability_scope=kb.capability_scope,
         metadata_json=dict(kb.metadata_json or {}),
     )
     db.add(row)
@@ -836,6 +850,7 @@ def knowledge_version_for_upload(
     source_version = ensure_knowledge_base_version(db, kb, branch.head_version)
     next_version = _next_knowledge_branch_version(branch)
     target_version = ensure_knowledge_base_version(db, kb, next_version)
+    target_version.capability_scope = source_version.capability_scope
     clone_knowledge_version_assets(
         db, tenant_id, knowledge_base_id, source_version.id, target_version.id
     )
@@ -926,12 +941,14 @@ def promote_knowledge_branch_to_overall(
     target = ensure_knowledge_base_version(db, kb, next_version)
     target.name = source.name
     target.description = source.description
+    target.capability_scope = source.capability_scope
     target.metadata_json = dict(source.metadata_json or {})
     target.status = "active"
     target.updated_at = utc_now()
     _retag_knowledge_version(db, tenant_id, knowledge_base_id, source.id, target.id)
     kb.name = source.name
     kb.description = source.description
+    kb.capability_scope = source.capability_scope
     kb.metadata_json = open_gallery_metadata(
         {**(kb.metadata_json or {}), "current_version": next_version}
     )
@@ -964,21 +981,12 @@ def rollback_knowledge_branch(
 def model_for_agent(
     db: Session, tenant_id: str, agent_id: str | None, role: str = "default"
 ) -> ResolvedModelConfig | None:
-    agent = get_agent(db, tenant_id, agent_id)
-    roles: Iterable[str] = (role, "default") if role != "default" else ("default",)
-    if agent:
-        for candidate_role in roles:
-            binding = db.exec(
-                select(AgentModelBinding).where(
-                    AgentModelBinding.tenant_id == tenant_id,
-                    AgentModelBinding.agent_id == agent.id,
-                    AgentModelBinding.role == candidate_role,
-                )
-            ).first()
-            if binding:
-                model = db.get(ModelConfig, binding.model_config_id)
-                if model and model.enabled:
-                    return _runtime_model(db, tenant_id, model)
+    """Resolve every employee task through the tenant's enabled default model.
+
+    ``agent_id`` and ``role`` remain in the signature for call-site compatibility. Employee-level
+    model bindings are intentionally no longer part of runtime model selection.
+    """
+    _ = agent_id, role
     model = db.exec(
         select(ModelConfig).where(
             ModelConfig.tenant_id == tenant_id,

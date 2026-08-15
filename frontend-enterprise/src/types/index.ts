@@ -1,14 +1,30 @@
+export type CapabilityScope = 'general' | 'sop_specific';
+
+export type SkillCapabilityRefs = {
+  general_skill_ids: string[];
+  tool_ids: string[];
+  knowledge_base_ids: string[];
+  required_general_skill_ids?: string[];
+  required_tool_ids?: string[];
+  required_knowledge_base_ids?: string[];
+};
+
+export type SkillGraphNode = Record<string, unknown> & {
+  capability_refs?: SkillCapabilityRefs;
+};
+
 export type SkillCard = {
   skill_id: string;
   name: string;
   version: string;
   business_domain?: string;
   description: string;
+  step_timeout_seconds?: number | null;
   trigger_intents: string[];
   user_utterance_examples: string[];
   goal: string[];
   required_info: string[];
-  nodes: Array<Record<string, unknown>>;
+  nodes: SkillGraphNode[];
   edges: Array<Record<string, unknown>>;
   start_node_id: string;
   terminal_node_ids: string[];
@@ -38,6 +54,7 @@ export type KnowledgeBaseRead = {
   tenant_id: string;
   name: string;
   description?: string;
+  capability_scope?: CapabilityScope;
   status: string;
   version?: string;
   branch_sync_state?: string;
@@ -182,10 +199,17 @@ export type AgentProfileRead = {
   status: 'active' | 'archived' | string;
   runtime: string;
   runtime_config: Record<string, unknown>;
+  harness_max_actions?: number;
   metadata: Record<string, unknown>;
   resources: AgentResourceBindingRead[];
   created_at: string;
   updated_at: string;
+};
+
+export type AgentModelBindingRead = {
+  role: string;
+  model_config_id: string;
+  effective: boolean;
 };
 
 export type ToolSuggestion = {
@@ -267,6 +291,7 @@ export type GeneralSkillRead = {
   slug: string;
   name: string;
   description?: string;
+  capability_scope?: CapabilityScope;
   homepage?: string;
   skill_markdown: string;
   skill_files: Array<{
@@ -275,6 +300,7 @@ export type GeneralSkillRead = {
     size?: number;
     mime_type?: string;
   }>;
+  skill_directories?: string[];
   metadata: Record<string, unknown>;
   status: 'draft' | 'published' | 'archived';
   permissions: Record<string, unknown>;
@@ -298,7 +324,7 @@ export type ModelConfigRead = {
   tenant_id: string;
   name: string;
   provider: string;
-  api_protocol: 'openai_chat_completions' | 'anthropic_messages' | 'gemini_generate_content';
+  api_protocol: 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages' | 'gemini_generate_content';
   base_url?: string;
   api_key_masked: string;
   model: string;
@@ -329,6 +355,19 @@ export type UIConfigRead = {
   show_tool_trace: boolean;
   reflection_max_rounds: number;
   agent_loop_max_actions: number;
+  sandbox_enabled: boolean;
+  harness_storage_path: string;
+  effective_harness_storage_path: string;
+  restart_scheduled?: boolean;
+  sandbox_network_mode: 'all' | 'allowlist' | 'deny';
+  sandbox_allowed_domains: string[];
+  sandbox_backend?: string | null;
+  sandbox_setup_required?: boolean;
+  sandbox_setup_instructions?: string | null;
+  sandbox_status?: 'ready' | 'unavailable' | 'degraded' | 'disabled';
+  sandbox_status_code?: string | null;
+  sandbox_status_message?: string | null;
+  sandbox_status_remediation?: string | null;
   updated_at: string;
 };
 
@@ -352,6 +391,7 @@ export type ToolRead = {
   name: string;
   display_name?: string;
   description?: string;
+  capability_scope?: CapabilityScope;
   bucket: string;
   tool_type: 'http' | 'mcp' | string;
   method: string;
@@ -359,6 +399,9 @@ export type ToolRead = {
   headers: Record<string, unknown>;
   auth: Record<string, unknown>;
   mcp_config: Record<string, unknown>;
+  execution_policy?: {
+    timeout_seconds: number;
+  } | null;
   input_schema: Record<string, unknown>;
   output_schema: Record<string, unknown>;
   allowed_skills: string[];
@@ -370,6 +413,7 @@ export type ToolRead = {
 };
 
 export type MCPTransport = 'stdio' | 'streamable_http' | 'sse' | 'builtin';
+export type MCPAppsMode = 'disabled' | 'auto';
 
 export type MCPServerConnection = {
   transport: MCPTransport;
@@ -389,6 +433,10 @@ export type MCPServerRead = {
   description?: string;
   bucket: string;
   connection: MCPServerConnection;
+  apps_mode: MCPAppsMode;
+  apps_negotiated: boolean;
+  negotiated_capabilities: Record<string, unknown>;
+  capability_scope?: CapabilityScope;
   enabled: boolean;
   last_synced_at?: string | null;
   tool_count: number;
@@ -398,17 +446,24 @@ export type MCPServerRead = {
 
 export type MCPDiscoveredTool = {
   name: string;
+  title: string;
   description: string;
   input_schema: Record<string, unknown>;
   output_schema: Record<string, unknown>;
+  annotations: Record<string, unknown>;
+  meta: Record<string, unknown>;
+  app?: { resource_uri: string; visibility: string[] } | null;
   imported: boolean;
   tool_id?: string | null;
   enabled?: boolean | null;
+  capability_scope?: CapabilityScope | null;
 };
 
 export type MCPDiscoverResponse = {
   success: boolean;
   tools: MCPDiscoveredTool[];
+  server_capabilities: Record<string, unknown>;
+  server_info: Record<string, unknown>;
   error?: { code: string; message: string } | null;
 };
 
@@ -506,8 +561,18 @@ export type ChatAttachmentRead = {
   text?: string | null;
   preview?: string | null;
   data_url?: string | null;
+  sandbox_path?: string | null;
+  sha256?: string | null;
   python_summary?: string | null;
   error?: string | null;
+};
+
+export type ChatSlashCommand = {
+  kind: 'sop' | 'skill' | 'tool';
+  target: string;
+  label: string;
+  description: string;
+  command: string;
 };
 
 export type KnowledgeCitation = {
@@ -528,6 +593,28 @@ export type KnowledgeCitation = {
   concept_type?: string;
 };
 
+export type HarnessWorkspaceArtifact = {
+  type: 'workspace_file';
+  task_frame_id: string;
+  path: string;
+  sandbox_path?: string | null;
+  sha256?: string | null;
+  size?: number | null;
+  display_name?: string | null;
+  description?: string | null;
+  content_type?: string | null;
+  operation?: string | null;
+  source?: string | null;
+};
+
+export type HarnessArtifact =
+  | HarnessWorkspaceArtifact
+  | {
+      type: 'human_handoff' | string;
+      handoff_id?: string | null;
+      [key: string]: unknown;
+    };
+
 export type ChatMessage = {
   id: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -536,6 +623,7 @@ export type ChatMessage = {
     attachments?: ChatAttachmentRead[];
     knowledge_citations?: KnowledgeCitation[];
     knowledge_query?: Record<string, unknown>;
+    harness_artifacts?: HarnessArtifact[];
     [key: string]: unknown;
   };
   created_at: string;
@@ -613,11 +701,26 @@ export type EnterpriseChatSessionRead = {
 export type EnterpriseSessionDetailRead = {
   session: EnterpriseChatSessionRead;
   messages: FeedbackMessageRead[];
+  feedback: Array<Record<string, unknown>>;
   events: Array<{
     id: string;
     event_type: string;
     payload: Record<string, unknown>;
     created_at: string;
+  }>;
+  traces: TurnTraceRead[];
+  tool_invocations?: Array<{
+    id: string;
+    task_id: string;
+    run_id: string;
+    call_id: string;
+    tool_name: string;
+    status: string;
+    arguments: Record<string, unknown>;
+    result: Record<string, unknown>;
+    replayed_from_invocation_id?: string | null;
+    started_at: string;
+    finished_at?: string | null;
   }>;
 };
 
@@ -653,6 +756,8 @@ export type TraceLineRead = {
   outputTitle?: string | null;
   state: 'running' | 'completed' | 'failed';
   collapsible?: boolean | null;
+  duration_ms?: number | null;
+  model_duration_ms?: number | null;
 };
 
 export type TurnTraceRead = {
@@ -661,6 +766,9 @@ export type TurnTraceRead = {
   started_at: string;
   completed_at?: string | null;
   lines: TraceLineRead[];
+  duration_ms?: number | null;
+  model_duration_ms?: number | null;
+  model_call_count?: number | null;
 };
 
 export type TraceSummary = {
@@ -799,11 +907,20 @@ export type ChannelConversationRead = {
   updated_at: string;
 };
 
+export type ChannelConversationAttachmentRead = {
+  id?: string;
+  filename?: string;
+  content_type?: string;
+  size?: number;
+  kind?: string;
+};
+
 export type ChannelConversationMessageRead = {
   id: string;
   role: string;
   content: string;
   created_at: string;
+  attachments?: ChannelConversationAttachmentRead[];
 };
 
 export type ChannelBindCodeRead = {

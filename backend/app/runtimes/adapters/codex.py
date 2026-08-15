@@ -21,7 +21,7 @@ from app.agents.branching import model_for_agent
 from app.config import get_settings
 from app.core.agent_identity_prompt import AgentIdentityPrompt
 from app.core.cancellation import clear_chat_turn_cancelled, is_chat_turn_cancelled
-from app.core.legacy_conversation_projection import LegacyConversationProjection
+from app.core.conversation_projection import ConversationProjection
 from app.db.models import AgentProfile, ChatSession, Message, utc_now
 from app.knowledge.citations import (
     compact_knowledge_citation_labels,
@@ -121,7 +121,7 @@ class CodexAgentRuntime:
             chat_session.id,
             "user",
             request.message,
-            metadata=LegacyConversationProjection.user_message_metadata(request),
+            metadata=ConversationProjection.user_message_metadata(request),
         )
         self._events.bind_turn(user_message.id, request.client_turn_id)
         self._events.record(

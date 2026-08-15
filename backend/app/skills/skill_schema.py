@@ -5,6 +5,37 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class SkillCapabilityRefs(BaseModel):
+    """Capabilities explicitly exposed while this SOP node is active."""
+
+    general_skill_ids: list[str] = Field(default_factory=list)
+    tool_ids: list[str] = Field(default_factory=list)
+    knowledge_base_ids: list[str] = Field(default_factory=list)
+    required_general_skill_ids: list[str] = Field(default_factory=list)
+    required_tool_ids: list[str] = Field(default_factory=list)
+    required_knowledge_base_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_required_refs(self) -> "SkillCapabilityRefs":
+        pairs = (
+            ("required_general_skill_ids", self.required_general_skill_ids, self.general_skill_ids),
+            ("required_tool_ids", self.required_tool_ids, self.tool_ids),
+            (
+                "required_knowledge_base_ids",
+                self.required_knowledge_base_ids,
+                self.knowledge_base_ids,
+            ),
+        )
+        for field_name, required, allowed in pairs:
+            invalid = sorted(set(required) - set(allowed))
+            if invalid:
+                raise ValueError(
+                    f"{field_name} must be a subset of its selected capability ids: "
+                    + ", ".join(invalid)
+                )
+        return self
+
+
 class SkillGraphNode(BaseModel):
     node_id: str
     type: str = "collect_info"
@@ -15,6 +46,7 @@ class SkillGraphNode(BaseModel):
     expected_user_info: list[str] = Field(default_factory=list)
     allowed_actions: list[str] = Field(default_factory=list)
     knowledge_scope: dict[str, Any] = Field(default_factory=dict)
+    capability_refs: SkillCapabilityRefs = Field(default_factory=SkillCapabilityRefs)
     retry_policy: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -35,6 +67,7 @@ class SkillCard(BaseModel):
     version: str = "1.0.0"
     business_domain: Optional[str] = None
     description: str = ""
+    step_timeout_seconds: Optional[int] = Field(default=None, ge=1, le=3600)
     trigger_intents: list[str] = Field(default_factory=list)
     user_utterance_examples: list[str] = Field(default_factory=list)
     goal: list[str] = Field(default_factory=list)
@@ -60,12 +93,18 @@ class SkillCard(BaseModel):
             raise ValueError("start_node_id must reference an existing node.")
         if not self.terminal_node_ids:
             raise ValueError("terminal_node_ids must contain at least one node id.")
-        missing_terminal_ids = [node_id for node_id in self.terminal_node_ids if node_id not in node_id_set]
+        missing_terminal_ids = [
+            node_id for node_id in self.terminal_node_ids if node_id not in node_id_set
+        ]
         if missing_terminal_ids:
-            raise ValueError(f"terminal_node_ids reference missing nodes: {', '.join(missing_terminal_ids)}")
+            raise ValueError(
+                f"terminal_node_ids reference missing nodes: {', '.join(missing_terminal_ids)}"
+            )
         for edge in self.edges:
             if edge.source_node_id not in node_id_set:
-                raise ValueError(f"edge source_node_id references missing node: {edge.source_node_id}")
+                raise ValueError(
+                    f"edge source_node_id references missing node: {edge.source_node_id}"
+                )
             if edge.next_node_id not in node_id_set:
                 raise ValueError(f"edge next_node_id references missing node: {edge.next_node_id}")
         return self

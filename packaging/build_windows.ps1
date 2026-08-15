@@ -8,7 +8,11 @@ Set-Location $Repo
 if (-not $env:VERSION) { $env:VERSION = "0.1.0" }
 
 function Test-SigningConfigured {
-  return [bool]($env:WINDOWS_CERT_THUMBPRINT -or $env:WINDOWS_PFX_PATH)
+  return [bool](
+    $env:WINDOWS_CERT_THUMBPRINT -or
+    $env:WINDOWS_PFX_PATH -or
+    $env:WINDOWS_SIGNER_SCRIPT
+  )
 }
 
 function Assert-NativeCommandSucceeded {
@@ -105,17 +109,15 @@ Push-Location backend
 .\.venv\Scripts\pyinstaller ..\packaging\ultrarag.spec --noconfirm --distpath ..\packaging\out --workpath ..\packaging\build
 Assert-NativeCommandSucceeded "PyInstaller build"
 Pop-Location
+& packaging\out\staffdeck\staffdeck.exe --packaging-smoke
+Assert-NativeCommandSucceeded "Packaged Lark SDK smoke test"
 
 $signingConfigured = Test-SigningConfigured
 if ($signingConfigured) {
-  Write-Host "Signing staffdeck.exe"
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\sign_windows.ps1 `
-    -FilePath packaging\out\staffdeck\staffdeck.exe
-  Assert-NativeCommandSucceeded "staffdeck.exe signing"
   $env:WINDOWS_SIGN_ENABLED = "1"
 } else {
   $env:WINDOWS_SIGN_ENABLED = "0"
-  Write-Warning "Code signing is not configured; Windows artifacts will be UNSIGNED."
+  Write-Warning "No Windows signer configured: building an UNSIGNED package. Windows SRT may automatically run in degraded mode; configure WINDOWS_CERT_THUMBPRINT, WINDOWS_PFX_PATH, or WINDOWS_SIGNER_SCRIPT for production security."
 }
 
 Write-Host "==> [4/6] Bundle the Python skill runtime"
@@ -123,6 +125,30 @@ backend\.venv\Scripts\python packaging\fetch_runtime_python.py packaging\runtime
 Assert-NativeCommandSucceeded "Python skill runtime download"
 if (Test-Path packaging\out\staffdeck\runtime) { Remove-Item -Recurse -Force packaging\out\staffdeck\runtime }
 Copy-Item -Recurse -Force packaging\runtime_dl\python packaging\out\staffdeck\runtime
+
+Write-Host "==> [4b/6] Bundle SRT + Node runtime"
+if (Test-Path packaging\sandbox_runtime) { Remove-Item -Recurse -Force packaging\sandbox_runtime }
+if (Test-Path packaging\out\staffdeck\sandbox) { Remove-Item -Recurse -Force packaging\out\staffdeck\sandbox }
+& $PY.Command @($PY.PrefixArgs) packaging\fetch_sandbox_runtime.py packaging\sandbox_runtime
+Assert-NativeCommandSucceeded "SRT runtime preparation"
+Copy-Item -Recurse -Force packaging\sandbox_runtime packaging\out\staffdeck\sandbox
+& $PY.Command @($PY.PrefixArgs) packaging\smoke_sandbox_bundle.py packaging\out\staffdeck\sandbox
+Assert-NativeCommandSucceeded "Final SRT bundle smoke test"
+
+if ($signingConfigured) {
+  Write-Host "Signing bundled Windows executable payload"
+  $signableExtensions = @(".exe", ".dll", ".pyd", ".node")
+  $signableFiles = Get-ChildItem packaging\out\staffdeck -Recurse -File |
+    Where-Object { $signableExtensions -contains $_.Extension.ToLowerInvariant() }
+  foreach ($file in $signableFiles) {
+    & packaging\sign_windows.ps1 -FilePath $file.FullName
+    Assert-NativeCommandSucceeded "Payload signing: $($file.FullName)"
+  }
+}
+
+& packaging\out\staffdeck\runtime\python.exe -c `
+  "import ssl, sqlite3, requests, docx, openpyxl; print(sqlite3.sqlite_version)"
+Assert-NativeCommandSucceeded "Final bundled Python runtime smoke test"
 
 Write-Host "==> [5/6] Build the Inno Setup installer"
 $isccCandidates = @(

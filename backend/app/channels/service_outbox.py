@@ -23,6 +23,7 @@ from app.db.models import (
 from app.channels.adapters.base import channel_reaction_token
 from app.channels.service_durable_inbox import reaction_target
 from app.channels.service_identity import external_account_scope
+from app.session.origin import PILOTDECK_GROUP_CHAT_CHANNEL
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ _delivery_thread: threading.Thread | None = None
 _reaction_delivery_thread: threading.Thread | None = None
 _delivery_stop = threading.Event()
 _FEISHU_DEDUP_RECOVERY_SECONDS = 55 * 60
+_NON_DELIVERY_CHANNELS = {"public_api", PILOTDECK_GROUP_CHAT_CHANNEL}
 
 
 def _stage_failed_delivery(
@@ -132,7 +134,8 @@ def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Mess
     Web 会话不受渠道 staging 影响；渠道会话必须留下 delivery 或让事务失败。
     """
     try:
-        if not getattr(chat_session, "channel", None):
+        channel = str(getattr(chat_session, "channel", None) or "").strip()
+        if not channel or channel in _NON_DELIVERY_CHANNELS:
             return
         # 已锚定会话绝不跨 binding 回退，避免携带旧 target/context_token 串 Bot。
         binding = None

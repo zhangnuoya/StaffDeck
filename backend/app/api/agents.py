@@ -10,6 +10,9 @@ from sqlmodel import Session, select
 
 from app.agents.schema import (
     AgentModelsUpdateRequest,
+    AgentAPICredentialCreateRequest,
+    AgentAPICredentialCreated,
+    AgentAPICredentialRead,
     AgentProfileCreateRequest,
     AgentProfileRead,
     AgentProfileUpdateRequest,
@@ -40,6 +43,8 @@ from app.agents.branching import (
 )
 from app.db import get_session
 from app.db.models import (
+    APIClient,
+    APICredential,
     AgentModelBinding,
     AgentKnowledgeBranch,
     AgentProfile,
@@ -54,6 +59,7 @@ from app.db.models import (
     KnowledgeChunk,
     KnowledgeDocument,
     Message,
+    ModelConfig,
     ScheduledTask,
     Skill,
     Tool,
@@ -61,6 +67,12 @@ from app.db.models import (
     User,
 )
 from app.runtimes.contracts import AgentRuntimeKind, parse_runtime_kind
+from app.public_api.auth import generate_api_key
+from app.public_api.credential_profiles import (
+    AGENT_KEY_ALLOWED_SCOPES,
+    agent_access_for_scopes,
+    scopes_for_agent_access,
+)
 from app.security.auth import get_current_user
 from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
 from app.security.permissions import is_admin_user as _is_admin_user
@@ -72,6 +84,8 @@ IMPORT_LOCK_RETRY_DELAY_SECONDS = 0.5
 enterprise_router = APIRouter(prefix="/api/enterprise/agents", tags=["enterprise:agents"])
 chat_router = APIRouter(prefix="/api/chat/agents", tags=["chat:agents"])
 scope_router = APIRouter(prefix="/api/enterprise/agent-scope", tags=["enterprise:agent-scope"])
+
+STAFFDECK_AGENT_API_CLIENT_NAME = "StaffDeck 员工 API 密钥"
 
 
 @scope_router.get("", response_model=AgentScopeRead)
@@ -143,6 +157,7 @@ def create_agent(
         status="active",
         runtime=request.runtime.value,
         runtime_config_json=dict(request.runtime_config or {}),
+        harness_max_actions=request.harness_max_actions,
         metadata_json=_metadata_with_creator(request.metadata or {}, user),
     )
     db.add(row)
@@ -179,6 +194,116 @@ def get_agent(
     row = _get_agent(db, tenant_id, agent_id)
     _ensure_can_access_agent(row, current_user)
     return agent_read(row, _bindings_by_agent(db, tenant_id).get(row.id, []))
+
+
+@enterprise_router.get(
+    "/{agent_id}/api-credentials",
+    response_model=list[AgentAPICredentialRead],
+)
+def list_agent_api_credentials(
+    agent_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> list[AgentAPICredentialRead]:
+    agent = _get_agent(db, tenant_id, agent_id)
+    _ensure_can_manage_agent(agent, current_user)
+    rows = db.exec(
+        select(APICredential)
+        .where(
+            APICredential.tenant_id == tenant_id,
+            APICredential.agent_id == agent_id,
+        )
+        .order_by(APICredential.created_at.desc())
+    ).all()
+    return [_agent_api_credential_read(row) for row in rows]
+
+
+@enterprise_router.post(
+    "/{agent_id}/api-credentials",
+    response_model=AgentAPICredentialCreated,
+)
+def create_agent_api_credential(
+    agent_id: str,
+    request: AgentAPICredentialCreateRequest,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentAPICredentialCreated:
+    agent = _get_agent(db, request.tenant_id, agent_id)
+    _ensure_can_manage_agent(agent, current_user)
+    if agent.is_overall:
+        raise HTTPException(status_code=400, detail="Open gallery cannot own an employee API key")
+    client = _ensure_staffdeck_agent_api_client(db, request.tenant_id, current_user)
+    token, prefix, digest = generate_api_key()
+    row = APICredential(
+        tenant_id=request.tenant_id,
+        client_id=client.id,
+        agent_id=agent_id,
+        name=request.name.strip(),
+        key_prefix=prefix,
+        key_digest=digest,
+        scopes_json=scopes_for_agent_access(request.access),
+        expires_at=request.expires_at,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return AgentAPICredentialCreated(
+        **_agent_api_credential_read(row).model_dump(),
+        api_key=token,
+    )
+
+
+@enterprise_router.post(
+    "/{agent_id}/api-credentials/{credential_id}/rotate",
+    response_model=AgentAPICredentialCreated,
+)
+def rotate_agent_api_credential(
+    agent_id: str,
+    credential_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentAPICredentialCreated:
+    agent = _get_agent(db, tenant_id, agent_id)
+    _ensure_can_manage_agent(agent, current_user)
+    row = _get_agent_api_credential(db, tenant_id, agent_id, credential_id)
+    token, prefix, digest = generate_api_key()
+    row.key_prefix = prefix
+    row.key_digest = digest
+    row.status = "active"
+    row.revoked_at = None
+    row.updated_at = utc_now()
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return AgentAPICredentialCreated(
+        **_agent_api_credential_read(row).model_dump(),
+        api_key=token,
+    )
+
+
+@enterprise_router.post(
+    "/{agent_id}/api-credentials/{credential_id}/revoke",
+    response_model=AgentAPICredentialRead,
+)
+def revoke_agent_api_credential(
+    agent_id: str,
+    credential_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentAPICredentialRead:
+    agent = _get_agent(db, tenant_id, agent_id)
+    _ensure_can_manage_agent(agent, current_user)
+    row = _get_agent_api_credential(db, tenant_id, agent_id, credential_id)
+    row.status = "revoked"
+    row.revoked_at = utc_now()
+    row.updated_at = utc_now()
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _agent_api_credential_read(row)
 
 
 @enterprise_router.get("/{agent_id}/work-record", response_model=AgentWorkRecordRead)
@@ -280,6 +405,8 @@ def update_agent(
         row.runtime = request.runtime.value
     if request.runtime_config is not None:
         row.runtime_config_json = dict(request.runtime_config)
+    if request.harness_max_actions is not None:
+        row.harness_max_actions = request.harness_max_actions
     if request.metadata is not None:
         row.metadata_json = _metadata_preserving_creator(
             row.metadata_json or {}, request.metadata, user
@@ -289,6 +416,37 @@ def update_agent(
     db.commit()
     db.refresh(row)
     return agent_read(row, _bindings_by_agent(db, request.tenant_id).get(row.id, []))
+
+
+@enterprise_router.post("/{agent_id}/gallery:unpublish", response_model=AgentProfileRead)
+def unpublish_agent_from_gallery(
+    agent_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentProfileRead:
+    """Remove an employee from the open gallery without deleting the employee itself."""
+    _ensure_admin_user(tenant_id, current_user)
+    row = _get_agent(db, tenant_id, agent_id)
+    if row.is_overall:
+        raise HTTPException(status_code=400, detail="Overall agent cannot be unpublished")
+
+    metadata = dict(row.metadata_json or {})
+    if metadata.get("published_to_gallery") is not True:
+        return agent_read(row, _bindings_by_agent(db, tenant_id).get(row.id, []))
+
+    now = utc_now()
+    metadata["published_to_gallery"] = False
+    metadata["gallery_unpublished_at"] = now.isoformat()
+    metadata["gallery_unpublished_by"] = current_user.username
+    metadata.pop("gallery_published_at", None)
+    metadata.pop("gallery_published_by", None)
+    row.metadata_json = metadata
+    row.updated_at = now
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return agent_read(row, _bindings_by_agent(db, tenant_id).get(row.id, []))
 
 
 @enterprise_router.delete("/{agent_id}")
@@ -584,29 +742,32 @@ def update_agent_models(
     current_user: User = Depends(get_current_user),
 ) -> dict[str, object]:
     _ensure_can_manage_agent(_get_agent(db, request.tenant_id, agent_id), current_user)
-    for item in request.bindings:
-        existing = db.exec(
-            select(AgentModelBinding).where(
-                AgentModelBinding.tenant_id == request.tenant_id,
-                AgentModelBinding.agent_id == agent_id,
-                AgentModelBinding.role == item.role,
-            )
-        ).first()
-        if existing:
-            existing.model_config_id = item.model_config_id
-            existing.updated_at = utc_now()
-            db.add(existing)
-            continue
-        db.add(
-            AgentModelBinding(
-                tenant_id=request.tenant_id,
-                agent_id=agent_id,
-                role=item.role,
-                model_config_id=item.model_config_id,
-            )
-        )
+    # Employee-specific model selection has been retired. Keep this endpoint as a backwards-
+    # compatible reset operation so older clients cannot recreate legacy bindings.
+    _delete_agent_model_bindings(db, request.tenant_id, agent_id)
     db.commit()
     return {"status": "updated", "agent_id": agent_id}
+
+
+@enterprise_router.get("/{agent_id}/models", response_model=list[dict[str, object]])
+def get_agent_models(
+    agent_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> list[dict[str, object]]:
+    agent = _get_agent(db, tenant_id, agent_id)
+    _ensure_can_access_agent(agent, current_user)
+    default = db.exec(
+        select(ModelConfig).where(
+            ModelConfig.tenant_id == tenant_id,
+            ModelConfig.is_default == True,  # noqa: E712
+            ModelConfig.enabled == True,  # noqa: E712
+        )
+    ).first()
+    if default is None:
+        return []
+    return [{"role": "default", "model_config_id": default.id, "effective": False}]
 
 
 @chat_router.get("", response_model=list[AgentProfileRead])
@@ -833,6 +994,7 @@ def agent_read(
         status=row.status,
         runtime=row.runtime or "native",
         runtime_config=dict(row.runtime_config_json or {}),
+        harness_max_actions=max(1, min(int(row.harness_max_actions or 32), 100)),
         metadata=metadata,
         resources=[binding_read(binding) for binding in bindings],
         created_at=row.created_at.isoformat(),
@@ -855,6 +1017,67 @@ def _is_database_locked_error(exc: OperationalError) -> bool:
 def _ensure_request_tenant(tenant_id: str, user: User) -> None:
     if user.tenant_id != tenant_id:
         raise HTTPException(status_code=403, detail="Tenant mismatch")
+
+
+def _ensure_staffdeck_agent_api_client(
+    db: Session,
+    tenant_id: str,
+    current_user: User,
+) -> APIClient:
+    row = db.exec(
+        select(APIClient).where(
+            APIClient.tenant_id == tenant_id,
+            APIClient.name == STAFFDECK_AGENT_API_CLIENT_NAME,
+        )
+    ).first()
+    required_scopes = sorted({"credentials:write", *AGENT_KEY_ALLOWED_SCOPES})
+    if row:
+        if row.status != "active" or not set(required_scopes).issubset(row.scopes_json or []):
+            row.status = "active"
+            row.scopes_json = sorted(set(row.scopes_json or []) | set(required_scopes))
+            row.updated_at = utc_now()
+            db.add(row)
+            db.flush()
+        return row
+    row = APIClient(
+        tenant_id=tenant_id,
+        name=STAFFDECK_AGENT_API_CLIENT_NAME,
+        description="由数字员工设置页管理的单员工运行密钥。",
+        scopes_json=required_scopes,
+        created_by_user_id=current_user.id,
+        metadata_json={"managed_by": "agent_settings"},
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _get_agent_api_credential(
+    db: Session,
+    tenant_id: str,
+    agent_id: str,
+    credential_id: str,
+) -> APICredential:
+    row = db.get(APICredential, credential_id)
+    if not row or row.tenant_id != tenant_id or row.agent_id != agent_id:
+        raise HTTPException(status_code=404, detail="Employee API credential not found")
+    return row
+
+
+def _agent_api_credential_read(row: APICredential) -> AgentAPICredentialRead:
+    return AgentAPICredentialRead(
+        id=row.id,
+        agent_id=str(row.agent_id or ""),
+        name=row.name,
+        access=agent_access_for_scopes(list(row.scopes_json or [])),
+        key_prefix=f"{row.key_prefix}…",
+        scopes=list(row.scopes_json or []),
+        status=row.status,
+        expires_at=row.expires_at,
+        last_used_at=row.last_used_at,
+        created_at=row.created_at,
+        revoked_at=row.revoked_at,
+    )
 
 
 def _agent_visible_to_user(row: AgentProfile, user: User) -> bool:
@@ -1373,21 +1596,20 @@ def _resource_display_id(resource_type: str, resolved: AgentResource) -> str:
 def _copy_agent_models_from_source(
     db: Session, tenant_id: str, source: AgentProfile, target: AgentProfile
 ) -> None:
+    # Model bindings are intentionally not copied. Every employee inherits the tenant default.
+    _ = source
+    _delete_agent_model_bindings(db, tenant_id, target.id)
+
+
+def _delete_agent_model_bindings(db: Session, tenant_id: str, agent_id: str) -> None:
     bindings = db.exec(
         select(AgentModelBinding).where(
             AgentModelBinding.tenant_id == tenant_id,
-            AgentModelBinding.agent_id == source.id,
+            AgentModelBinding.agent_id == agent_id,
         )
     ).all()
     for binding in bindings:
-        db.add(
-            AgentModelBinding(
-                tenant_id=tenant_id,
-                agent_id=target.id,
-                role=binding.role,
-                model_config_id=binding.model_config_id,
-            )
-        )
+        db.delete(binding)
 
 
 def _copy_skill_branch(

@@ -1,8 +1,11 @@
 import pytest
 
 from app.llm.client import LLMClient, LLMError, _thinking_mode_for_model
-from app.llm.protocol_drivers import ChatCompletionsDriver
-from app.llm.output_policy import operation_output_tokens
+from app.llm.protocol_drivers import ChatCompletionsDriver, ProtocolCallError
+from app.llm.output_policy import (
+    operation_empty_response_retries,
+    operation_output_tokens,
+)
 from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY, stage_payload
 from app.llm.schemas import ModelConfigCreateRequest
 from app.observability.spans import bind_span_sink, llm_operation
@@ -150,6 +153,41 @@ def test_generate_text_uses_chat_completions_only():
         {"role": "user", "content": '{"hello": "world"}'},
     ]
     assert call["max_tokens"] == 256
+
+
+def test_generate_text_preserves_structured_protocol_diagnostics() -> None:
+    class FailingDriver:
+        request_kind = "responses"
+
+        def complete(self, _request):  # noqa: ANN001
+            raise ProtocolCallError(
+                "MODEL_UPSTREAM_ERROR",
+                status_code=422,
+                provider_code="invalid_model",
+                provider_message="model does not exist",
+                upstream_body='{"error":{"code":"invalid_model"}}',
+                request_id="req_123",
+            )
+
+    client = object.__new__(LLMClient)
+    client.driver = FailingDriver()
+    client.model = "missing-model"
+    client.base_url = "https://provider.example/v1"
+    client.timeout_seconds = 25.0
+    client.temperature = 0.2
+    client.max_output_tokens = 32
+
+    with pytest.raises(LLMError) as exc_info:
+        client.generate_text("system", {"message": "ping"})
+
+    error = exc_info.value
+    assert error.code == "MODEL_UPSTREAM_ERROR"
+    assert error.status_code == 422
+    assert error.provider_code == "invalid_model"
+    assert error.provider_message == "model does not exist"
+    assert error.request_id == "req_123"
+    assert "status_code=422" in str(error)
+    assert "upstream_body=" in str(error)
 
 
 def test_chat_completions_driver_preserves_non_stream_and_stream_requests():
@@ -313,6 +351,26 @@ def test_generate_text_retries_empty_response():
 
     assert client.generate_text("system prompt", {"hello": "world"}) == "ok"
     assert len(client.client.chat.completions.calls) == 3
+
+
+def test_knowledge_router_uses_lexical_fallback_after_first_empty_response():
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    client.client.chat.completions.create = lambda **kwargs: (  # noqa: E731
+        client.client.chat.completions.calls.append(kwargs)
+        or _completion_with_content("")
+    )
+
+    with llm_operation("knowledge.bucket_route"):
+        with pytest.raises(LLMError) as error:
+            client.generate_text("system prompt", {"query": "制度"})
+
+    assert len(client.client.chat.completions.calls) == 1
+    assert "after 1 attempts" in str(error.value)
 
 
 def test_generate_text_records_each_empty_response_retry():
@@ -820,6 +878,58 @@ def test_generate_text_does_not_guess_image_support_from_model_name():
     }
 
 
+def test_generate_text_retries_without_images_only_after_provider_rejects_them():
+    class RejectingImageCompletions(_FakeChatCompletions):
+        def create(self, **kwargs):  # noqa: ANN003
+            self.calls.append(kwargs)
+            content = kwargs["messages"][1]["content"]
+            if isinstance(content, list) and any(
+                part.get("type") == "image_url"
+                for part in content
+                if isinstance(part, dict)
+            ):
+                raise ValueError("image_url is unsupported by this model")
+            message = type("Message", (), {"content": "fallback-ok"})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Completion", (), {"choices": [choice]})()
+
+    client = object.__new__(LLMClient)
+    fake_client = _FakeOpenAIClient()
+    fake_client.chat.completions = RejectingImageCompletions()
+    client.client = fake_client
+    client.model = "provider-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+
+    output = client.generate_text(
+        "system prompt",
+        {
+            "conversation_context": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "看图，并参考 /workspace/attachments/screen.png",
+                        "images": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,AAAA"
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    )
+
+    assert output == "fallback-ok"
+    assert len(fake_client.chat.completions.calls) == 2
+    fallback_content = fake_client.chat.completions.calls[1]["messages"][1]["content"]
+    assert all(part.get("type") != "image_url" for part in fallback_content)
+    assert "/workspace/attachments/screen.png" in fallback_content[0]["text"]
+
+
 def test_generate_json_extracts_fenced_json(monkeypatch):
     client = object.__new__(LLMClient)
 
@@ -879,6 +989,11 @@ def test_internal_json_operation_caps_output_without_mutating_system_prompt():
 
 def test_internal_output_budget_never_increases_smaller_model_config():
     assert operation_output_tokens("router.scene", 256) == 256
+
+
+def test_knowledge_router_does_not_retry_empty_control_plane_responses():
+    assert operation_empty_response_retries("knowledge.bucket_route", 2) == 0
+    assert operation_empty_response_retries("response.generate", 2) == 2
 
 
 def test_user_visible_response_caps_output_budget_at_4096():
@@ -1194,4 +1309,3 @@ def test_generate_text_stream_preserves_budget_above_escalation_ceiling():
     assert len(calls) == 2
     assert calls[0]["max_tokens"] == 65536
     assert calls[1]["max_tokens"] == 65536
-

@@ -33,6 +33,7 @@ import {
 } from '../chatPageStyles';
 import { traceLineIconName, traceSummaryIconName } from '../chatHelpers';
 import type { CotTraceIconName, TraceLine } from '../chatTypes';
+import MCPAppView from './MCPAppView';
 
 const COT_ICON_MAP: Record<CotTraceIconName, ComponentType<SVGProps<SVGSVGElement>>> = {
   advance: IconCotAdvance,
@@ -108,17 +109,18 @@ export default function ExecutionRecord({
                 </span>
                 {line.detail && <span className={CHAT_TRACE_LINE_DETAIL_CLASS}>{t(line.detail)}</span>}
                 {line.code && (
-                  <details open className={CHAT_TRACE_CODE_DETAILS_CLASS}>
+                  <details className={CHAT_TRACE_CODE_DETAILS_CLASS}>
                     <summary className={CHAT_TRACE_CODE_SUMMARY_CLASS}>查看代码</summary>
                     <CodeBlock className={CHAT_TRACE_CODE_BLOCK_CLASS} code={line.code} language={line.language || 'python'} />
                   </details>
                 )}
                 {line.output && (
-                  <details open className={CHAT_TRACE_CODE_DETAILS_CLASS}>
+                  <details className={CHAT_TRACE_CODE_DETAILS_CLASS}>
                     <summary className={CHAT_TRACE_CODE_SUMMARY_CLASS}>{t(line.outputTitle || '查看输出')}</summary>
                     <CodeBlock className={CHAT_TRACE_CODE_BLOCK_CLASS} code={line.output} language={line.outputLanguage || 'text'} />
                   </details>
                 )}
+                {line.mcpApp && <MCPAppView descriptor={line.mcpApp} />}
               </span>
             </div>
           ))}

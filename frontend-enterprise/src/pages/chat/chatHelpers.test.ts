@@ -6,7 +6,10 @@ import type { ChatMessage } from '@/types';
 
 import {
   STREAM_TERMINAL_EVENTS,
+  MarkdownMessage,
   canRateMessage,
+  harnessEventTraceLine,
+  harnessWorkspaceArtifacts,
   knowledgeCitations,
   messageAttachments,
   renderInlineMarkdown,
@@ -25,6 +28,46 @@ function message(patch: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 describe('chat history consumer contract', () => {
+  it('continues top-level process numbering across blank lines and bullet details', () => {
+    const rendered = renderToStaticMarkup(
+      createElement(MarkdownMessage, {
+        content: [
+          '## 用印审批流程指引',
+          '',
+          '1. **申请入口**：登录审批系统',
+          '',
+          '1. **填写表单**：填写以下字段',
+          '',
+          '- 我方主体名称',
+          '- 申请日期',
+          '',
+          '1. **审批流程**：提交申请',
+          '',
+          '- 直属上级审批',
+          '',
+          '1. **用印办理**：前往办公室盖章',
+        ].join('\n'),
+      }),
+    );
+
+    expect(rendered.match(/<ol(?: start="\d+")?>/g)).toEqual([
+      '<ol>',
+      '<ol start="2">',
+      '<ol start="3">',
+      '<ol start="4">',
+    ]);
+  });
+
+  it('restarts an ordered list after regular paragraph content', () => {
+    const rendered = renderToStaticMarkup(
+      createElement(MarkdownMessage, {
+        content: ['1. 第一组', '', '这是新的正文段落。', '', '1. 第二组'].join('\n'),
+      }),
+    );
+
+    expect(rendered.match(/<ol(?: start="\d+")?>/g)).toEqual(['<ol>', '<ol>']);
+  });
+
   it('renders bare HTTP links without changing existing Markdown links or inline code', () => {
     const rendered = renderToStaticMarkup(
       createElement(
@@ -111,6 +154,46 @@ describe('chat history consumer contract', () => {
     expect(messageAttachments(item)).toEqual([attachment]);
   });
 
+  it('keeps only valid, unique workspace artifacts from persisted metadata', () => {
+    const item = message({
+      metadata: {
+        harness_artifacts: [
+          {
+            type: 'workspace_file',
+            task_frame_id: 'task-1',
+            path: 'reports/result.txt',
+            size: 12,
+            display_name: '季度报告.txt',
+            description: '最终版',
+            content_type: 'text/plain',
+            source: 'harness',
+          },
+          {
+            type: 'workspace_file',
+            task_frame_id: 'task-1',
+            path: 'reports/result.txt',
+            size: 14,
+          },
+          { type: 'human_handoff', handoff_id: 'handoff-1' },
+          { type: 'workspace_file', task_frame_id: '', path: 'invalid.txt' },
+        ],
+      },
+    });
+
+    expect(harnessWorkspaceArtifacts(item)).toEqual([
+      {
+        type: 'workspace_file',
+        task_frame_id: 'task-1',
+        path: 'reports/result.txt',
+        size: 12,
+        display_name: '季度报告.txt',
+        description: '最终版',
+        content_type: 'text/plain',
+        source: 'harness',
+      },
+    ]);
+  });
+
   it('allows feedback only for committed assistant messages', () => {
     expect(canRateMessage(message())).toBe(true);
     expect(canRateMessage(message({ isStreaming: true }))).toBe(false);
@@ -129,5 +212,74 @@ describe('chat history consumer contract', () => {
       'stream_end',
       'stream_interrupted',
     ]);
+  });
+
+  it('turns the Harness lifecycle into mergeable execution-record lines', () => {
+    const started = harnessEventTraceLine('task_frame_started', {
+      task_frame_id: 'task-weather',
+      kind: 'conversation',
+    });
+    const action = harnessEventTraceLine('harness_action_created', {
+      task_frame_id: 'task-weather',
+      iteration: 1,
+      action: 'tool',
+      tool_name: 'general_skill.weather',
+    });
+    const completed = harnessEventTraceLine('harness_tool_completed', {
+      task_frame_id: 'task-weather',
+      iteration: 1,
+      tool_name: 'general_skill.weather',
+      success: true,
+      result: {
+        success: true,
+        data: { structured_result: { temperature: 29 } },
+      },
+    });
+    const appView = harnessEventTraceLine('harness_mcp_app_view', {
+      task_frame_id: 'task-weather',
+      tool_name: 'weather.card',
+      mcp_app: {
+        server_id: 'server-weather',
+        resource_uri: 'ui://weather/card',
+        tool_name: 'weather.card',
+        visibility: ['model', 'app'],
+        mime_type: 'text/html;profile=mcp-app',
+      },
+    });
+    const finished = harnessEventTraceLine('task_frame_finished', {
+      task_frame_id: 'task-weather',
+      status: 'completed',
+      action_count: 2,
+    });
+
+    expect(started).toMatchObject({
+      id: 'harness_frame_task-weather',
+      text: '开始执行任务',
+      state: 'running',
+    });
+    expect(action).toMatchObject({
+      id: 'harness_action_task-weather_1',
+      text: '调用能力 general_skill.weather',
+      state: 'running',
+    });
+    expect(completed).toMatchObject({
+      id: 'harness_action_task-weather_1',
+      text: '能力调用完成 general_skill.weather',
+      state: 'completed',
+      outputLanguage: 'json',
+      outputTitle: '查看能力结果',
+    });
+    expect(completed?.output).toContain('"temperature": 29');
+    expect(appView).toMatchObject({
+      id: 'harness_mcp_app_task-weather_weather.card',
+      text: '展示 MCP App weather.card',
+      state: 'completed',
+      mcpApp: { resource_uri: 'ui://weather/card' },
+    });
+    expect(finished).toMatchObject({
+      id: 'harness_frame_task-weather',
+      text: '任务执行完成',
+      state: 'completed',
+    });
   });
 });

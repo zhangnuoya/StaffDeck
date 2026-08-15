@@ -18,11 +18,16 @@ import {
   TeamOutlined,
 } from '../icons';
 import type { HTMLAttributes, ReactNode } from 'react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, ApiError, TENANT_ID } from '../api/client';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
+import {
+  CapabilityScopeBadge,
+  CapabilityScopeControl,
+  normalizeCapabilityScope,
+} from '@/components/CapabilityScopeControl';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { ModelConfigDropdown } from '@/components/ModelConfigDropdown';
@@ -78,6 +83,7 @@ import { useClientPagination } from '../hooks/useClientPagination';
 import { renderMarkdownBlocks } from './chat/chatHelpers';
 import { getDateLocale } from '@/i18n';
 import type {
+  CapabilityScope,
   KnowledgeBaseRead,
   KnowledgeBucketRead,
   KnowledgeChunkRead,
@@ -93,6 +99,9 @@ import type {
 const KNOWLEDGE_PAGE_SIZE = 10;
 const KNOWLEDGE_SEARCH_MODEL_STORAGE_KEY = 'knowledge-search-model';
 const TERMINAL_KNOWLEDGE_JOB_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
+const KnowledgeGraphVisualization = lazy(() => import('@/components/knowledge/KnowledgeGraphVisualization').then(
+  (module) => ({ default: module.KnowledgeGraphVisualization }),
+));
 
 type KnowledgeBaseVersionRead = {
   id: string;
@@ -177,7 +186,12 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   const [importLoading, setImportLoading] = useState(false);
   const [editingKnowledgeBase, setEditingKnowledgeBase] = useState<KnowledgeBaseRead | null>(null);
   const [deleteKbTarget, setDeleteKbTarget] = useState<KnowledgeBaseRead | null>(null);
-  const [knowledgeBaseDraft, setKnowledgeBaseDraft] = useState({ name: '', description: '', status: 'active' });
+  const [knowledgeBaseDraft, setKnowledgeBaseDraft] = useState({
+    name: '',
+    description: '',
+    status: 'active',
+    capability_scope: 'general' as CapabilityScope,
+  });
   const [versionKnowledgeBase, setVersionKnowledgeBase] = useState<KnowledgeBaseRead | null>(null);
   const [knowledgeBaseVersions, setKnowledgeBaseVersions] = useState<KnowledgeBaseVersionRead[]>([]);
   const [editingDocument, setEditingDocument] = useState<KnowledgeDocumentRead | null>(null);
@@ -713,6 +727,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       name: row.name,
       description: row.description || '',
       status: row.status === 'archived' ? 'archived' : 'active',
+      capability_scope: normalizeCapabilityScope(row.capability_scope),
     });
   }
 
@@ -725,6 +740,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         name: knowledgeBaseDraft.name,
         description: knowledgeBaseDraft.description,
         status: knowledgeBaseDraft.status,
+        capability_scope: knowledgeBaseDraft.capability_scope,
       });
       setKnowledgeBases((current) => current.map((item) => (item.id === next.id ? next : item)));
       setEditingKnowledgeBase(null);
@@ -978,6 +994,12 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       render: (row) => statusTag(row.status),
     },
     {
+      key: 'capability_scope',
+      title: '能力范围',
+      width: 105,
+      render: (row) => <CapabilityScopeBadge value={row.capability_scope} />,
+    },
+    {
       key: 'creator',
       title: '创建者',
       width: 120,
@@ -1032,6 +1054,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       </div>
       <div className="mt-[10px] flex flex-wrap items-center gap-[6px]">
         {statusTag(item.status)}
+        <CapabilityScopeBadge value={item.capability_scope} />
         {item.version ? <KTag>v{item.version}</KTag> : null}
         <KTag>{item.document_count} 文档</KTag>
         <KTag>{item.bucket_count} 目录</KTag>
@@ -1458,6 +1481,11 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
               <SelectItem value="archived">下线</SelectItem>
             </SelectContent>
           </UISelect>
+          <CapabilityScopeControl
+            value={knowledgeBaseDraft.capability_scope}
+            onChange={(value) => setKnowledgeBaseDraft((prev) => ({ ...prev, capability_scope: value }))}
+            resourceType="knowledge_base"
+          />
         </div>
       </KDialog>
       <KDialog
@@ -1604,6 +1632,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
   const navigate = useNavigate();
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
+  const [capabilityScope, setCapabilityScope] = useState<CapabilityScope>('general');
   const [jobs, setJobs] = useState<Record<string, KnowledgeIngestJobRead>>({});
   const [agentId, setAgentId] = useState(() => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '');
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
@@ -1740,6 +1769,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
         filename: file.name,
         title: file.name.replace(/\.[^.]+$/, ''),
         content_base64: contentBase64,
+        capability_scope: capabilityScope,
       });
       setJobs((prev) => ({ ...prev, [job.id]: job }));
       await refreshKnowledgeBases();
@@ -1843,10 +1873,16 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
                 <small>
                   {item.document_count} 文档 / {item.bucket_count} 目录 / {item.chunk_count} 引用
                 </small>
+                <CapabilityScopeBadge value={item.capability_scope} />
               </div>
             ))}
           </div>
         )}
+        <CapabilityScopeControl
+          value={capabilityScope}
+          onChange={setCapabilityScope}
+          resourceType="knowledge_base"
+        />
         <FileDropzone
           multiple
           accept=".doc,.docx,.txt,.md,.markdown,.html,.htm,.pdf"
@@ -2109,6 +2145,7 @@ function 目录索引Overview({
   const [detailView, setDetailView] = useState<KnowledgeDetailView | null>(null);
   const [detailFocusKey, setDetailFocusKey] = useState<string | null>(null);
   const [activeContentView, setActiveContentView] = useState<KnowledgeContentView>('evidence');
+  const [wikiPresentation, setWikiPresentation] = useState<'graph' | 'cards'>('graph');
   const metadata = document.metadata || {};
   const documentCard = isRecord(metadata.document_card) ? metadata.document_card : {};
   const wikiStructureConcepts = useMemo(() => sortWikiConcepts(okfConcepts), [okfConcepts]);
@@ -2247,13 +2284,33 @@ function 目录索引Overview({
         </div>
       </div>
 
-      <div className="knowledge-overview-panel">
+      <div className={cn('knowledge-overview-panel', activeContentView === 'wiki' && wikiPresentation === 'graph' && 'is-graph')}>
         <div className="knowledge-overview-panel-head">
           <span>
             <strong>{activeContent.title}</strong>
             <small>{activeContent.description}</small>
           </span>
-          <div className="flex items-center gap-[8px]">
+          <div className="knowledge-overview-panel-actions">
+            {activeContentView === 'wiki' && (
+              <div className="knowledge-graph-view-switch" aria-label="知识图谱呈现方式">
+                <button
+                  type="button"
+                  className={wikiPresentation === 'graph' ? 'is-active' : ''}
+                  aria-pressed={wikiPresentation === 'graph'}
+                  onClick={() => setWikiPresentation('graph')}
+                >
+                  图谱
+                </button>
+                <button
+                  type="button"
+                  className={wikiPresentation === 'cards' ? 'is-active' : ''}
+                  aria-pressed={wikiPresentation === 'cards'}
+                  onClick={() => setWikiPresentation('cards')}
+                >
+                  卡片
+                </button>
+              </div>
+            )}
             <KTag>{activeContent.count}</KTag>
             <button
               type="button"
@@ -2264,58 +2321,70 @@ function 目录索引Overview({
             </button>
           </div>
         </div>
-        {activeContentView === 'sections' && (
-          <div className="knowledge-layer-explain" aria-label="知识层级说明">
-            <span>
-              <strong>目录索引</strong>
-              <small>目录索引，用于按资料、章节、主题逐级展开</small>
-            </span>
-            <span>
-              <strong>知识图谱</strong>
-              <small>最底层可读知识页，回答时基于页面内容并追溯引用来源</small>
-            </span>
-          </div>
+        {activeContentView === 'wiki' && wikiPresentation === 'graph' ? (
+          <Suspense fallback={<div className="kgv-empty">加载中…</div>}>
+            <KnowledgeGraphVisualization
+              concepts={okfConcepts}
+              knowledgeBaseKey={knowledgeBase?.id || document.knowledge_base_id}
+              onViewConcept={onViewConcept}
+            />
+          </Suspense>
+        ) : (
+          <>
+            {activeContentView === 'sections' && (
+              <div className="knowledge-layer-explain" aria-label="知识层级说明">
+                <span>
+                  <strong>目录索引</strong>
+                  <small>目录索引，用于按资料、章节、主题逐级展开</small>
+                </span>
+                <span>
+                  <strong>知识图谱</strong>
+                  <small>最底层可读知识页，回答时基于页面内容并追溯引用来源</small>
+                </span>
+              </div>
+            )}
+            <div className="knowledge-mini-list">
+              {activeContent.items.length === 0 ? (
+                <span className="knowledge-empty-note">{activeContent.emptyText}</span>
+              ) : (
+                activeContent.items.map((entry) => (
+                  <button
+                    type="button"
+                    className="knowledge-mini-item"
+                    key={`${activeContentView}-${entry.key}`}
+                    onClick={() => {
+                      if (activeContentView === 'sections' && entry.indexGroup) {
+                        openContentDetail('sections', entry.indexGroup.key);
+                        return;
+                      }
+                      if ((activeContentView === 'sections' || activeContentView === 'wiki') && entry.concept) {
+                        onViewConcept(entry.concept);
+                        return;
+                      }
+                      if (activeContentView === 'evidence' && entry.bucket) {
+                        openContentDetail('evidence', entry.bucket.id);
+                        return;
+                      }
+                      openContentDetail(activeContentView, entry.key);
+                    }}
+                    title={
+                      activeContentView === 'sections' && entry.indexGroup
+                        ? '查看目录下的知识图谱'
+                        : (activeContentView === 'sections' || activeContentView === 'wiki') && entry.concept
+                          ? '查看知识图谱'
+                          : activeContentView === 'evidence'
+                            ? '查看引用来源'
+                          : '查看详情'
+                    }
+                  >
+                    <strong>{entry.title}</strong>
+                    <small>{entry.summary}</small>
+                  </button>
+                ))
+              )}
+            </div>
+          </>
         )}
-        <div className="knowledge-mini-list">
-          {activeContent.items.length === 0 ? (
-            <span className="knowledge-empty-note">{activeContent.emptyText}</span>
-          ) : (
-            activeContent.items.map((entry) => (
-              <button
-                type="button"
-                className="knowledge-mini-item"
-                key={`${activeContentView}-${entry.key}`}
-                onClick={() => {
-                  if (activeContentView === 'sections' && entry.indexGroup) {
-                    openContentDetail('sections', entry.indexGroup.key);
-                    return;
-                  }
-                  if ((activeContentView === 'sections' || activeContentView === 'wiki') && entry.concept) {
-                    onViewConcept(entry.concept);
-                    return;
-                  }
-                  if (activeContentView === 'evidence' && entry.bucket) {
-                    openContentDetail('evidence', entry.bucket.id);
-                    return;
-                  }
-                  openContentDetail(activeContentView, entry.key);
-                }}
-                title={
-                  activeContentView === 'sections' && entry.indexGroup
-                    ? '查看目录下的知识图谱'
-                    : (activeContentView === 'sections' || activeContentView === 'wiki') && entry.concept
-                      ? '查看知识图谱'
-                      : activeContentView === 'evidence'
-                        ? '查看引用来源'
-                      : '查看详情'
-                }
-              >
-                <strong>{entry.title}</strong>
-                <small>{entry.summary}</small>
-              </button>
-            ))
-          )}
-        </div>
       </div>
 
       <KDialog

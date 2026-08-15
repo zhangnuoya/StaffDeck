@@ -24,6 +24,50 @@ def test_resolve_secret_header(monkeypatch):
     assert headers["Authorization"] == "Bearer token-123"
 
 
+def test_resolve_basic_auth_header(monkeypatch):
+    monkeypatch.setenv("TOOL_PASSWORD", "123456")
+    executor = object.__new__(ToolExecutor)
+
+    headers = executor._resolve_headers(
+        {},
+        {
+            "type": " basic ",
+            "basic": {"username": "admin", "password": "${secret.TOOL_PASSWORD}"},
+        },
+    )
+
+    assert headers["Authorization"] == "Basic YWRtaW46MTIzNDU2"
+
+
+def test_explicit_authorization_header_takes_precedence_over_basic_auth():
+    executor = object.__new__(ToolExecutor)
+
+    headers = executor._resolve_headers(
+        {"Authorization": "Custom value"},
+        {"type": "basic", "basic": {"username": "admin", "password": "123456"}},
+    )
+
+    assert headers["Authorization"] == "Custom value"
+
+
+def test_unknown_auth_type_is_forwarded_as_literal_headers(monkeypatch):
+    monkeypatch.setenv("VENDOR_TOKEN", "token-123")
+    executor = object.__new__(ToolExecutor)
+
+    headers = executor._resolve_headers(
+        {"Content-Type": "application/json"},
+        {
+            "X-API-Key": "${secret.VENDOR_TOKEN}",
+            "X-Scope": "staff",
+            "X-Options": {"region": "cn"},
+        },
+    )
+
+    assert headers["X-API-Key"] == "token-123"
+    assert headers["X-Scope"] == "staff"
+    assert headers["X-Options"] == '{"region":"cn"}'
+
+
 def test_internal_mock_request_adds_service_token_only_for_configured_origin() -> None:
     executor = object.__new__(ToolExecutor)
     executor.settings = type(
@@ -130,6 +174,13 @@ def test_execution_policy_uses_tool_timeout_and_falls_back_for_invalid_values() 
     )
 
     assert executor._execution_policy(configured).timeout_seconds == 20
+    assert (
+        executor._execution_policy(
+            configured,
+            timeout_seconds_override=3.5,
+        ).timeout_seconds
+        == 3.5
+    )
     assert executor._execution_policy(invalid).timeout_seconds == 8
 
 
@@ -170,6 +221,60 @@ def test_execute_http_tool_passes_configured_timeout_to_client(monkeypatch) -> N
 
     assert result.success is True
     assert captured["timeout"] == 20
+
+
+def test_execute_a2a_tool_sends_standard_send_message_request(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, *, timeout: float):
+            captured["timeout"] = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, url, *, headers=None, json=None):
+            captured.update(url=url, headers=headers, payload=json)
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": json["id"], "result": {"kind": "message", "parts": [{"text": "done"}]}},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="a2a.finance",
+                tool_type="a2a",
+                method="POST",
+                url="https://agent.example.test/a2a",
+                config_json={
+                    "a2a_version": "1.0",
+                    "accepted_output_modes": ["text/plain"],
+                    "execution": {"timeout_seconds": 25},
+                },
+                enabled=True,
+            )
+        )
+        db.commit()
+
+        result = ToolExecutor(db).execute(
+            "tenant_demo",
+            ToolCall(name="a2a.finance", arguments={"query": "查询报销制度"}),
+        )
+
+    assert result.success is True
+    assert result.data == {"kind": "message", "parts": [{"text": "done"}]}
+    assert captured["timeout"] == 25
+    assert captured["headers"]["A2A-Version"] == "1.0"
+    assert captured["payload"]["method"] == "SendMessage"
+    assert captured["payload"]["params"]["message"]["parts"] == [{"text": "查询报销制度"}]
 
 
 def test_execute_mcp_tool_passes_configured_timeout(monkeypatch) -> None:

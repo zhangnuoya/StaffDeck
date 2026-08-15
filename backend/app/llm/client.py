@@ -17,13 +17,18 @@ from anthropic import Anthropic
 from app.config import get_settings
 from app.db.models import ModelConfig
 from app.llm.model_protocols import ModelApiProtocol
-from app.llm.output_policy import operation_output_tokens
+from app.llm.output_policy import (
+    operation_empty_response_retries,
+    operation_output_tokens,
+)
 from app.llm.protocol_drivers import (
     AnthropicMessagesDriver,
     CancellationToken,
     ChatCompletionsDriver,
     GeminiGenerateContentDriver,
+    OpenAIResponsesDriver,
     ProtocolCallError,
+    _protocol_call_error,
 )
 from app.llm.stage_protocol import (
     STAGE_PROTOCOL_KEY,
@@ -36,6 +41,41 @@ from app.security.encryption import decrypt_secret
 
 class LLMError(Exception):
     """Raised when an LLM provider request or response normalization fails."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        provider_message: str | None = None,
+        upstream_body: str | None = None,
+        request_id: str | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code or (
+            message if message.startswith("MODEL_") and " " not in message else None
+        )
+        self.status_code = status_code
+        self.provider_code = provider_code
+        self.provider_message = provider_message
+        self.upstream_body = upstream_body
+        self.request_id = request_id
+        self.retryable = retryable
+
+    def public_detail(self) -> dict[str, Any]:
+        return {
+            "code": self.code or "MODEL_CONNECTION_FAILED",
+            "message": str(self),
+            "upstream_status": self.status_code,
+            "provider_code": self.provider_code,
+            "provider_message": self.provider_message,
+            "upstream_body": self.upstream_body,
+            "request_id": self.request_id,
+            "retryable": self.retryable,
+        }
 
 
 JSON_REPAIR_ATTEMPTS = 3
@@ -92,6 +132,13 @@ class LLMClient:
                 timeout=self.timeout_seconds,
             )
             self.driver = ChatCompletionsDriver(self.client)
+        elif protocol is ModelApiProtocol.OPENAI_RESPONSES:
+            self.client = OpenAI(
+                api_key=api_key,
+                base_url=self.base_url,
+                timeout=self.timeout_seconds,
+            )
+            self.driver = OpenAIResponsesDriver(self.client)
         elif protocol is ModelApiProtocol.ANTHROPIC_MESSAGES:
             kwargs: dict[str, Any] = {
                 "api_key": api_key,
@@ -99,7 +146,17 @@ class LLMClient:
                 "max_retries": 0,
             }
             if self.base_url:
-                kwargs["base_url"] = self.base_url
+                # Anthropic's SDK always appends /v1/messages. If an operator
+                # already configured a /v1 API root, remove only that suffix
+                # for the SDK transport so the effective URL remains exactly
+                # the configured API root plus /messages.
+                sdk_base_url = self.base_url.rstrip("/")
+                sdk_path = urlsplit(sdk_base_url).path.rstrip("/")
+                if sdk_path.endswith("/v1/messages"):
+                    sdk_base_url = sdk_base_url[: -len("/v1/messages")].rstrip("/")
+                elif sdk_path.endswith("/v1"):
+                    sdk_base_url = sdk_base_url[:-3].rstrip("/")
+                kwargs["base_url"] = sdk_base_url
             self.client = Anthropic(**kwargs)
             self.driver = AnthropicMessagesDriver(self.client)
         elif protocol is ModelApiProtocol.GEMINI_GENERATE_CONTENT:
@@ -141,8 +198,10 @@ class LLMClient:
         response_format: dict[str, str] | None = None,
         cancellation: CancellationToken | None = None,
     ) -> str:
-        max_output_tokens = operation_output_tokens(
-            current_llm_operation(), self.max_output_tokens
+        operation = current_llm_operation()
+        max_output_tokens = operation_output_tokens(operation, self.max_output_tokens)
+        empty_response_retries = operation_empty_response_retries(
+            operation, EMPTY_RESPONSE_RETRIES
         )
         context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
@@ -175,7 +234,7 @@ class LLMClient:
             )
             empty_diagnostics: list[str] = []
             current_max_tokens = max_output_tokens
-            for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
+            for attempt in range(empty_response_retries + 1):
                 request["max_tokens"] = current_max_tokens
                 span = start_llm_call(
                     model=self.model,
@@ -184,7 +243,7 @@ class LLMClient:
                     stream=False,
                     attempt=attempt + 1,
                     retry_count=attempt,
-                    max_attempts=EMPTY_RESPONSE_RETRIES + 1,
+                    max_attempts=empty_response_retries + 1,
                     max_output_tokens=current_max_tokens,
                     thinking_mode=getattr(self, "thinking_mode", "") or "provider_default",
                     **request_shape,
@@ -193,6 +252,12 @@ class LLMClient:
                     completion = self._protocol_driver().complete(request)
                 except BaseException as exc:
                     span.fail(exc, **_completion_span_metrics(None))
+                    if _image_parameter_unsupported(exc) and _messages_have_images(
+                        request_messages
+                    ):
+                        request_messages = _without_image_parts(request_messages)
+                        request["messages"] = request_messages
+                        continue
                     raise
                 content = _completion_message_content(completion)
                 metrics = _completion_span_metrics(completion)
@@ -228,14 +293,15 @@ class LLMClient:
                     and metrics.get("reasoning_chars", 0) > 0
                 ):
                     current_max_tokens = _escalate_reasoning_token_budget(current_max_tokens)
-                if attempt >= EMPTY_RESPONSE_RETRIES:
+                if attempt >= empty_response_retries:
                     raise LLMError(_empty_response_detail(self, empty_diagnostics))
         except Exception as exc:
             if isinstance(exc, LLMError):
                 raise
             if isinstance(exc, ProtocolCallError):
-                raise LLMError(exc.code) from exc
-            raise LLMError(_provider_failure_detail(self, exc)) from exc
+                raise _llm_error_from_protocol(self, exc) from exc
+            protocol_error = _protocol_call_error(exc)
+            raise _llm_error_from_protocol(self, protocol_error) from exc
 
     def generate_text_stream(
         self,
@@ -243,8 +309,10 @@ class LLMClient:
         user_payload: dict[str, Any] | str,
         cancellation: CancellationToken | None = None,
     ) -> Iterator[str]:
-        max_output_tokens = operation_output_tokens(
-            current_llm_operation(), self.max_output_tokens
+        operation = current_llm_operation()
+        max_output_tokens = operation_output_tokens(operation, self.max_output_tokens)
+        empty_response_retries = operation_empty_response_retries(
+            operation, EMPTY_RESPONSE_RETRIES
         )
         context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
@@ -261,7 +329,7 @@ class LLMClient:
         try:
             empty_diagnostics: list[str] = []
             current_max_tokens = max_output_tokens
-            for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
+            for attempt in range(empty_response_retries + 1):
                 span = start_llm_call(
                     model=self.model,
                     endpoint=_endpoint_label(getattr(self, "base_url", "")),
@@ -269,7 +337,7 @@ class LLMClient:
                     stream=True,
                     attempt=attempt + 1,
                     retry_count=attempt,
-                    max_attempts=EMPTY_RESPONSE_RETRIES + 1,
+                    max_attempts=empty_response_retries + 1,
                     max_output_tokens=current_max_tokens,
                     thinking_mode=getattr(self, "thinking_mode", "") or "provider_default",
                     **request_shape,
@@ -345,6 +413,11 @@ class LLMClient:
                         reasoning_chars=reasoning_chars,
                         **stream_usage_metrics,
                     )
+                    if not emitted_text and _image_parameter_unsupported(
+                        exc
+                    ) and _messages_have_images(request_messages):
+                        request_messages = _without_image_parts(request_messages)
+                        continue
                     raise
                 if emitted_text:
                     span.finish(
@@ -399,23 +472,32 @@ class LLMClient:
             if isinstance(exc, LLMError):
                 raise
             if isinstance(exc, ProtocolCallError):
-                raise LLMError(exc.code) from exc
-            raise LLMError(_provider_failure_detail(self, exc)) from exc
+                raise _llm_error_from_protocol(self, exc) from exc
+            protocol_error = _protocol_call_error(exc)
+            raise _llm_error_from_protocol(self, protocol_error) from exc
 
     def _protocol_driver(
         self,
-    ) -> ChatCompletionsDriver | AnthropicMessagesDriver | GeminiGenerateContentDriver:
+    ) -> (
+        ChatCompletionsDriver
+        | OpenAIResponsesDriver
+        | AnthropicMessagesDriver
+        | GeminiGenerateContentDriver
+    ):
         driver = getattr(self, "driver", None)
         if driver is None:
-            if getattr(self, "api_protocol", ModelApiProtocol.OPENAI_CHAT_COMPLETIONS) is (
-                ModelApiProtocol.GEMINI_GENERATE_CONTENT
-            ):
+            protocol = getattr(
+                self, "api_protocol", ModelApiProtocol.OPENAI_CHAT_COMPLETIONS
+            )
+            if protocol is ModelApiProtocol.GEMINI_GENERATE_CONTENT:
                 driver = GeminiGenerateContentDriver(
                     self.client,
                     self.base_url,
                     getattr(self, "api_key", ""),
                     self.model,
                 )
+            elif protocol is ModelApiProtocol.OPENAI_RESPONSES:
+                driver = OpenAIResponsesDriver(self.client)
             else:
                 driver = ChatCompletionsDriver(self.client)
             self.driver = driver
@@ -672,6 +754,88 @@ def _request_messages(
     elif not context_messages:
         messages.append({"role": "user", "content": "{}"})
     return messages
+
+
+def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(part, dict)
+        and str(part.get("type") or "") in {"image", "image_url", "input_image"}
+        for message in messages
+        for part in (
+            message.get("content")
+            if isinstance(message.get("content"), list)
+            else []
+        )
+    )
+
+
+def _without_image_parts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stripped = copy.deepcopy(messages)
+    for message in stripped:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        text_parts = [
+            part
+            for part in content
+            if not (
+                isinstance(part, dict)
+                and str(part.get("type") or "")
+                in {"image", "image_url", "input_image"}
+            )
+        ]
+        message["content"] = text_parts or [
+            {
+                "type": "text",
+                "text": "图片参数不受当前模型支持；请改用任务中提供的沙箱文件路径。",
+            }
+        ]
+    return stripped
+
+
+def _image_parameter_unsupported(exc: BaseException) -> bool:
+    fragments: list[str] = []
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        fragments.extend((str(current), repr(current)))
+        body = getattr(current, "body", None)
+        if body is not None:
+            try:
+                fragments.append(json.dumps(body, ensure_ascii=False, default=str))
+            except (TypeError, ValueError):
+                fragments.append(str(body))
+        response = getattr(current, "response", None)
+        response_text = getattr(response, "text", None)
+        if response_text:
+            fragments.append(str(response_text))
+        current = current.__cause__ or current.__context__
+    detail = " ".join(fragments).lower()
+    image_markers = (
+        "image_url",
+        "input_image",
+        "image input",
+        "image parameter",
+        "vision",
+        "multimodal",
+        "图片",
+        "图像",
+    )
+    unsupported_markers = (
+        "not support",
+        "unsupported",
+        "does not accept",
+        "invalid content type",
+        "invalid parameter",
+        "unknown parameter",
+        "not allowed",
+        "不支持",
+        "无效参数",
+    )
+    return any(marker in detail for marker in image_markers) and any(
+        marker in detail for marker in unsupported_markers
+    )
 
 
 def _fit_request_messages(
@@ -952,7 +1116,7 @@ def _stream_empty_diagnostic(
 
 
 def _empty_response_detail(client: Any, diagnostics: list[str]) -> str:
-    attempts = EMPTY_RESPONSE_RETRIES + 1
+    attempts = max(1, len(diagnostics))
     model = _safe_fragment(getattr(client, "model", None), 80) or "unknown"
     endpoint = _endpoint_label(getattr(client, "base_url", None))
     response_details = " | ".join(diagnostics)
@@ -968,8 +1132,9 @@ def _provider_failure_detail(client: Any, exc: Exception) -> str:
     timeout = getattr(client, "timeout_seconds", None)
     status_code = getattr(exc, "status_code", None)
     request_id = _safe_fragment(getattr(exc, "request_id", None), 64)
-    error_type = type(exc).__name__
-    message = _safe_fragment(exc, 240) or "no provider error message"
+    error_type = getattr(exc, "code", None) or type(exc).__name__
+    provider_message = _safe_fragment(getattr(exc, "provider_message", None), 400)
+    message = provider_message or _safe_fragment(exc, 240) or "no provider error message"
     provider_code = ""
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
@@ -978,6 +1143,10 @@ def _provider_failure_detail(client: Any, exc: Exception) -> str:
         provider_message = _safe_fragment(error_body.get("message"), 160)
         if provider_message and provider_message not in message:
             message = f"{message}; provider_message={provider_message}"
+    explicit_provider_code = _safe_fragment(getattr(exc, "provider_code", None), 64)
+    if explicit_provider_code:
+        provider_code = explicit_provider_code
+    upstream_body = _safe_fragment(getattr(exc, "upstream_body", None), 2_000)
     details = [
         f"LLM provider request failed ({error_type})",
         f"message={message}",
@@ -990,9 +1159,24 @@ def _provider_failure_detail(client: Any, exc: Exception) -> str:
         details.append(f"provider_code={provider_code}")
     if request_id:
         details.append(f"request_id={request_id}")
+    if upstream_body:
+        details.append(f"upstream_body={upstream_body}")
     if timeout is not None:
         details.append(f"timeout_seconds={timeout}")
     return "; ".join(details)
+
+
+def _llm_error_from_protocol(client: Any, exc: ProtocolCallError) -> LLMError:
+    return LLMError(
+        _provider_failure_detail(client, exc),
+        code=exc.code,
+        status_code=exc.status_code,
+        provider_code=exc.provider_code,
+        provider_message=exc.provider_message,
+        upstream_body=exc.upstream_body,
+        request_id=exc.request_id,
+        retryable=exc.retryable,
+    )
 
 
 def _content_shape(content: Any) -> str:

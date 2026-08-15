@@ -20,8 +20,10 @@ import {
   UploadOutlined,
   WarningOutlined,
 } from '../icons';
+import { Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from 'lucide-react';
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -30,13 +32,17 @@ import {
   type CSSProperties,
   type DragEvent,
   type HTMLAttributes,
+  type HTMLInputTypeAttribute,
   type KeyboardEvent,
   type MouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type RefObject,
+  type WheelEvent as ReactWheelEvent,
 } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
+  Checkbox,
   Dialog,
   DialogContent,
   DialogFooter,
@@ -60,6 +66,7 @@ import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import AppHeader from '@/components/AppHeader';
+import { CapabilityScopeBadge } from '@/components/CapabilityScopeControl';
 import { ModelConfigDropdown } from '@/components/ModelConfigDropdown';
 import { cn } from '@/lib/utils';
 import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
@@ -80,6 +87,7 @@ import {
   CHAT_ATTACHMENTS_USER_CLASS,
   CHAT_CARD_CLASS,
   CHAT_CARD_DRAGGING_CLASS,
+  CHAT_CARD_FULLSCREEN_CLASS,
   CHAT_ACTIONS_CLASS,
   CHAT_COMPOSER_SHELL_CLASS,
   CHAT_CONFIRM_CLASS,
@@ -90,6 +98,17 @@ import {
   CHAT_EDIT_PANEL_CLASS,
   CHAT_EDIT_PANEL_USER_ATTACHMENTS_CLASS,
   CHAT_EDIT_TEXTAREA_CLASS,
+  CHAT_FAILURE_BUTTON_CLASS,
+  CHAT_FAILURE_CLASS,
+  CHAT_FAILURE_COPY_CLASS,
+  CHAT_FAILURE_DETAILS_CLASS,
+  CHAT_FAILURE_ICON_CLASS,
+  CHAT_FAILURE_LABEL_CLASS,
+  CHAT_FAILURE_META_CLASS,
+  CHAT_FAILURE_RAW_CLASS,
+  CHAT_FAILURE_STAGE_CLASS,
+  CHAT_FAILURE_SUMMARY_CLASS,
+  CHAT_FAILURE_VALUE_CLASS,
   CHAT_HOVER_ACTIONS_CLASS,
   CHAT_HOVER_BUTTON_CLASS,
   CHAT_MESSAGES_CLASS,
@@ -122,6 +141,7 @@ import {
   FLOW_CLASS,
   FLOW_COMPACT_META_CLASS,
   FLOW_COMPACT_ROW_CLASS,
+  FLOW_CONNECTION_PREVIEW_CLASS,
   FLOW_EDGES_CLASS,
   FLOW_EDGE_PATH_CLASS,
   FLOW_GRAPH_CANVAS_CLASS,
@@ -129,10 +149,19 @@ import {
   FLOW_META_LABEL_CLASS,
   FLOW_META_ROW_CLASS,
   FLOW_NODE_BADGES_CLASS,
+  FLOW_NODE_CONNECT_HANDLE_ACTIVE_CLASS,
+  FLOW_NODE_CONNECT_HANDLE_CLASS,
   FLOW_NODE_POSITION_CLASS,
   FLOW_NODE_SHELL_CLASS,
   FLOW_NODE_SUMMARY_CLASS,
   FLOW_ROOT_POSITION_CLASS,
+  FLOW_FULLSCREEN_CLASS,
+  FLOW_FULLSCREEN_PANNABLE_CLASS,
+  FLOW_FULLSCREEN_WITH_AI_CLASS,
+  FLOW_INSPECTOR_BODY_CLASS,
+  FLOW_INSPECTOR_CLASS,
+  FLOW_INSPECTOR_EMPTY_CLASS,
+  FLOW_INSPECTOR_HEADER_CLASS,
   FLOW_ROUTE_COUNT_CLASS,
   FLOW_RULE_CONDITION_CONTROLS_CLASS,
   FLOW_RULE_CONDITION_INPUT_CLASS,
@@ -151,9 +180,18 @@ import {
   FLOW_RULE_PRIORITY_CLASS,
   FLOW_RULE_TARGET_CLASS,
   FLOW_ZOOM_SHELL_CLASS,
+  FLOW_ZOOM_CONTROLS_CLASS,
   FLOW_ZOOM_STEP_BUTTON_CLASS,
   FLOW_ZOOM_TOOLBAR_CLASS,
+  FLOW_ZOOM_TOOLBAR_FULLSCREEN_CLASS,
   FLOW_ZOOM_VALUE_CLASS,
+  FLOW_VIEWER_CLASS,
+  FLOW_VIEWER_BODY_CLASS,
+  FLOW_VIEWER_FULLSCREEN_CLASS,
+  FLOW_VIEWER_FULLSCREEN_PANEL_CLASS,
+  FLOW_VIEWER_TITLE_CLASS,
+  FLOW_VIEWER_TITLE_MARK_CLASS,
+  FLOW_VIEWER_TITLE_META_CLASS,
   flowZoomPresetButtonClass,
   INLINE_ADD_CLASS,
   INLINE_ADD_SETTLED_CLASS,
@@ -183,6 +221,7 @@ import {
   SELECTION_MARK_CLASS,
   SOURCE_ACTION_ADD_CLASS,
   SOURCE_ACTION_EDIT_BUTTON_CLASS,
+  SOURCE_ACTION_EMPTY_CLASS,
   SOURCE_ACTION_EDITOR_CLASS,
   SOURCE_ACTION_LIST_CLASS,
   SOURCE_ACTION_LIST_EDITABLE_CLASS,
@@ -249,8 +288,28 @@ import {
   uploadItemClass,
   type ToolStatusBadgeVariant,
 } from './distillPageStyles';
+import { buildDistillFailure, type DistillFailure } from './distillFailure';
+import {
+  normalizeSkillFlowWheelDelta,
+  reanchorSkillFlowConnection,
+  skillNodeFlowPosition,
+  withSkillNodeFlowPosition,
+  withoutSkillEdgeAt,
+  type SkillFlowConnectionPreview,
+  type SkillFlowPosition,
+} from './skillFlowModel';
 import { api, ApiError, streamGet, streamPost, TENANT_ID } from '../api/client';
-import type { ModelConfigRead, SkillCard, SkillRead, ToolProbeResponse, ToolRead, ToolSuggestion } from '../types';
+import { copyTextToClipboard } from '@/lib/clipboard';
+import type {
+  GeneralSkillRead,
+  KnowledgeBaseRead,
+  ModelConfigRead,
+  SkillCard,
+  SkillRead,
+  ToolProbeResponse,
+  ToolRead,
+  ToolSuggestion,
+} from '../types';
 
 type ChatItem = {
   id: string;
@@ -262,6 +321,8 @@ type ChatItem = {
   thinking?: 'running' | 'done';
   thinkingDetails?: string[];
   thinkingOpen?: boolean;
+  failure?: DistillFailure;
+  failureOpen?: boolean;
   warnings?: string[];
   toolSuggestions?: ToolSuggestionItem[];
   actionState?: 'pending' | 'confirmed' | 'rejected';
@@ -307,6 +368,27 @@ type ViewMode = 'source' | 'flow';
 type SelectOption = {
   value: string;
   label: string;
+};
+
+type CapabilityReferenceOption = SelectOption & {
+  description?: string;
+  capabilityScope?: unknown;
+  unavailableReason?: string;
+};
+
+const CAPABILITY_REFERENCE_FIELDS = [
+  'general_skill_ids',
+  'tool_ids',
+  'knowledge_base_ids',
+  'required_general_skill_ids',
+  'required_tool_ids',
+  'required_knowledge_base_ids',
+];
+
+const REQUIRED_CAPABILITY_FIELD_BY_ALLOWED: Record<string, string> = {
+  general_skill_ids: 'required_general_skill_ids',
+  tool_ids: 'required_tool_ids',
+  knowledge_base_ids: 'required_knowledge_base_ids',
 };
 
 const NODE_TYPE_OPTIONS: SelectOption[] = [
@@ -520,6 +602,8 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     outgoingText: string;
   } | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('source');
+  const [flowFullscreen, setFlowFullscreen] = useState(false);
+  const [flowAssistantPanelOpen, setFlowAssistantPanelOpen] = useState(true);
   const [loading, setLoading] = useState(false);
   const [attachments, setAttachments] = useState<UploadAttachment[]>([]);
   const [dragActive, setDragActive] = useState(false);
@@ -527,6 +611,8 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const [toolDetailMessageId, setToolDetailMessageId] = useState<string | null>(null);
   const [probeArgsText, setProbeArgsText] = useState('');
   const [tools, setTools] = useState<ToolRead[]>([]);
+  const [generalSkills, setGeneralSkills] = useState<GeneralSkillRead[]>([]);
+  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
   const [modelConfigs, setModelConfigs] = useState<ModelConfigRead[]>([]);
   const [selectedRewriteModelId, setSelectedRewriteModelId] = useState(
     () => window.localStorage.getItem(`${DISTILL_REWRITE_MODEL_STORAGE_KEY}:${TENANT_ID}`) || '',
@@ -732,10 +818,21 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }, [active]);
 
   useEffect(() => {
-    api
-      .get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentQuery}`)
-      .then(setTools)
-      .catch(() => setTools([]));
+    void Promise.all([
+      api
+        .get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentQuery}`)
+        .catch(() => [] as ToolRead[]),
+      api
+        .get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentQuery}`)
+        .catch(() => [] as GeneralSkillRead[]),
+      api
+        .get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${agentQuery}`)
+        .catch(() => [] as KnowledgeBaseRead[]),
+    ]).then(([toolRows, skillRows, knowledgeRows]) => {
+      setTools(toolRows);
+      setGeneralSkills(skillRows);
+      setKnowledgeBases(knowledgeRows);
+    });
   }, [agentQuery]);
 
   useEffect(() => {
@@ -913,7 +1010,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
             return;
           }
           if (item.event === 'error') {
-            updateMessage(assistantId, String(item.data.message || '生成失败，当前草稿未变更。'), { thinking: 'done' });
+            applyDistillFailure(assistantId, item.data.message, 'distill');
             setActiveJob(null);
           }
         },
@@ -922,7 +1019,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     } catch (error) {
       if (controller.signal.aborted && !manualStopRef.current) return;
       appendThinkingDetail(assistantId, '生成失败，已保留当前草稿');
-      updateMessage(assistantId, '生成失败，当前草稿未变更。', { thinking: 'done' });
+      applyDistillFailure(assistantId, error, 'distill');
       if (controller.signal.aborted) {
         notify.info('已停止生成');
       } else {
@@ -942,7 +1039,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   ) {
     if (!currentDraft) return;
     setSourceAutoScroll(false);
-    const editableDraft = lockSkillIdForDraft(currentDraft, lockedSkillId);
+    const editableDraft = canonicalizeSkillCapabilityRefs(lockSkillIdForDraft(currentDraft, lockedSkillId));
     const previousDraft = cloneSkill(editableDraft);
     const targets = targetPathsOverride?.length
       ? targetPathsOverride
@@ -1041,7 +1138,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
             return;
           }
           if (item.event === 'error') {
-            updateMessage(assistantId, String(item.data.message || '改写失败，当前草稿未变更。'), { thinking: 'done' });
+            applyDistillFailure(assistantId, item.data.message, 'rewrite');
             setActiveJob(null);
           }
         },
@@ -1050,7 +1147,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     } catch (error) {
       if (controller.signal.aborted && !manualStopRef.current) return;
       appendThinkingDetail(assistantId, '改写失败，已保留当前草稿');
-      updateMessage(assistantId, '改写失败，当前草稿未变更。', { thinking: 'done' });
+      applyDistillFailure(assistantId, error, 'rewrite');
       if (controller.signal.aborted) {
         notify.info('已停止改写');
       } else {
@@ -1083,7 +1180,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       notify.info('当前没有内容变化，无需保存草稿。');
       return;
     }
-    let finalDraft: SkillCard = lockSkillIdForDraft(saveReviewDraft, lockedSkillId);
+    let finalDraft: SkillCard = canonicalizeSkillCapabilityRefs(
+      lockSkillIdForDraft(saveReviewDraft, lockedSkillId),
+    );
     let renamedSkillId = '';
     try {
       let savedSkill: SkillRead;
@@ -1183,7 +1282,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       return;
     }
     if (item.event === 'error') {
-      updateMessage(job.assistantId, String(item.data.message || '生成失败'), { thinking: 'done' });
+      applyDistillFailure(job.assistantId, item.data.message, job.kind);
       setActiveJob(null);
       setLoading(false);
       return;
@@ -1191,7 +1290,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     if (item.event === 'job_complete') {
       const status = String(item.data.status || '');
       if (status === 'failed') {
-        updateMessage(job.assistantId, String(item.data.error || '生成失败'), { thinking: 'done' });
+        applyDistillFailure(job.assistantId, item.data.error, job.kind);
         setActiveJob(null);
       }
     }
@@ -1713,6 +1812,43 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     );
   }
 
+  function applyDistillFailure(
+    assistantId: string,
+    error: unknown,
+    kind: ActiveDistillJob['kind'],
+  ) {
+    const failure = buildDistillFailure(error, kind);
+    updateMessage(assistantId, '当前草稿未变更，可以调整要求或模型配置后重试。', {
+      thinking: 'done',
+      failure,
+      failureOpen: false,
+    });
+  }
+
+  function toggleFailureDetails(messageId: string) {
+    setMessages((current) =>
+      current.map((item) =>
+        item.id === messageId ? { ...item, failureOpen: !item.failureOpen } : item,
+      ),
+    );
+  }
+
+  async function copyFailureDetails(failure: DistillFailure) {
+    const text = [
+      `${failure.summary} · ${failure.stage}`,
+      failure.code ? `错误码：${failure.code}` : '',
+      failure.detail,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    try {
+      await copyTextToClipboard(text);
+      notify.success('错误详情已复制');
+    } catch {
+      notify.error('复制错误详情失败');
+    }
+  }
+
   function appendOperationToMessage(id: string, operation: DistillHistoryOperation) {
     setMessages((current) =>
       current.map((item) =>
@@ -2032,9 +2168,26 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       </div>
       <div className={WORKBENCH_CLASS}>
         <DistillSectionCard
-          className={cn(CHAT_CARD_CLASS, 'h-full min-h-0', dragActive && CHAT_CARD_DRAGGING_CLASS)}
+          className={cn(
+            CHAT_CARD_CLASS,
+            'h-full min-h-0',
+            dragActive && CHAT_CARD_DRAGGING_CLASS,
+            flowFullscreen && flowAssistantPanelOpen && CHAT_CARD_FULLSCREEN_CLASS,
+          )}
           bodyClassName={CHAT_CARD_BODY_CLASS}
-          title="对话蒸馏"
+          title={flowFullscreen ? 'AI 修改' : '对话蒸馏'}
+          extra={flowFullscreen && flowAssistantPanelOpen ? (
+            <UIButton
+              variant="ghost"
+              size="icon"
+              className="size-7 rounded-[8px] text-[#858b9c] hover:bg-[#f1f3f6] hover:text-[#18181a]"
+              aria-label="收起 AI 修改面板"
+              title="收起 AI 修改面板"
+              onClick={() => setFlowAssistantPanelOpen(false)}
+            >
+              <PanelLeftClose />
+            </UIButton>
+          ) : undefined}
           onDragEnter={handleDragEnter}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
@@ -2070,6 +2223,42 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                                 {detail}
                               </div>
                             ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {item.role === 'assistant' && item.failure && (
+                      <div className={CHAT_FAILURE_CLASS}>
+                        <button
+                          type="button"
+                          className={CHAT_FAILURE_BUTTON_CLASS}
+                          aria-expanded={Boolean(item.failureOpen)}
+                          onClick={() => toggleFailureDetails(item.id)}
+                        >
+                          <span className={CHAT_FAILURE_ICON_CLASS}>
+                            <CloseCircleOutlined />
+                          </span>
+                          <span className={CHAT_FAILURE_SUMMARY_CLASS}>{item.failure.summary}</span>
+                          <span className={CHAT_FAILURE_STAGE_CLASS}>{item.failure.stage}</span>
+                          {item.failureOpen ? <DownOutlined /> : <RightOutlined />}
+                        </button>
+                        {item.failureOpen && (
+                          <div className={CHAT_FAILURE_DETAILS_CLASS}>
+                            <div className={CHAT_FAILURE_META_CLASS}>
+                              <span className={CHAT_FAILURE_LABEL_CLASS}>阶段</span>
+                              <span className={CHAT_FAILURE_VALUE_CLASS}>{item.failure.stage}</span>
+                              <span className={CHAT_FAILURE_LABEL_CLASS}>错误码</span>
+                              <span className={CHAT_FAILURE_VALUE_CLASS}>{item.failure.code || '未提供'}</span>
+                            </div>
+                            <pre className={CHAT_FAILURE_RAW_CLASS}>{item.failure.detail}</pre>
+                            <button
+                              type="button"
+                              className={CHAT_FAILURE_COPY_CLASS}
+                              onClick={() => void copyFailureDetails(item.failure!)}
+                            >
+                              <CopyGlyph />
+                              复制错误详情
+                            </button>
                           </div>
                         )}
                       </div>
@@ -2293,9 +2482,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                     : '输入或粘贴需要整理的 SOP 流程说明'
                 }
               />
-              <div className={CHAT_ACTIONS_CLASS}>
-                <span className="min-w-0 truncate text-[12px] text-[#858b9c]">{streamStatus}</span>
-                <div className={CHAT_ACTIONS_GROUP_CLASS}>
+              <div className={cn(CHAT_ACTIONS_CLASS, flowFullscreen && 'flex-nowrap gap-[6px]')}>
+                <span className={cn('min-w-0 truncate text-[12px] text-[#858b9c]', flowFullscreen && 'sr-only')}>{streamStatus}</span>
+                <div className={cn(CHAT_ACTIONS_GROUP_CLASS, flowFullscreen && 'w-full flex-nowrap justify-start gap-[6px]')}>
                   <label>
                     <input
                       type="file"
@@ -2309,15 +2498,24 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                         event.target.value = '';
                       }}
                     />
-                    <UIButton asChild variant="outline" disabled={uploadingFile || loading} className={CARD_OUTLINE_BUTTON_CLASS}>
+                    <UIButton
+                      asChild
+                      variant="outline"
+                      disabled={uploadingFile || loading}
+                      className={cn(CARD_OUTLINE_BUTTON_CLASS, flowFullscreen && 'shrink-0 px-[10px]')}
+                    >
                       <span>
                         <UploadOutlined />
-                        上传文件
+                        {flowFullscreen ? '上传' : '上传文件'}
                       </span>
                     </UIButton>
                   </label>
                   {loading && (
-                    <UIButton variant="outline" className={CARD_OUTLINE_BUTTON_CLASS} onClick={stopStream}>
+                    <UIButton
+                      variant="outline"
+                      className={cn(CARD_OUTLINE_BUTTON_CLASS, flowFullscreen && 'shrink-0 px-[10px]')}
+                      onClick={stopStream}
+                    >
                       <StopOutlined />
                       停止
                     </UIButton>
@@ -2329,11 +2527,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                       setSelectedRewriteModelId(modelId);
                       window.localStorage.setItem(`${DISTILL_REWRITE_MODEL_STORAGE_KEY}:${TENANT_ID}`, modelId);
                     }}
-                    buttonClassName={REWRITE_MODEL_BUTTON_CLASS}
+                    buttonClassName={cn(
+                      REWRITE_MODEL_BUTTON_CLASS,
+                      flowFullscreen && 'min-w-0 flex-1 px-[10px]',
+                    )}
+                    menuClassName={flowFullscreen ? 'z-[130]' : undefined}
                   />
                   <UIButton
                     disabled={loading || uploadingFile || (!input.trim() && readyAttachments.length === 0)}
-                    className={PRIMARY_BUTTON_CLASS}
+                    className={cn(PRIMARY_BUTTON_CLASS, flowFullscreen && 'shrink-0 px-[12px]')}
                     onClick={() => void send()}
                   >
                     {loading ? <LoadingOutlined className="animate-spin" /> : <SendOutlined />}
@@ -2399,6 +2601,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
               textDiffs={textDiffs}
               toolDescriptions={toolDescriptions}
               toolStatuses={toolStatuses}
+              generalSkills={generalSkills}
+              tools={tools}
+              knowledgeBases={knowledgeBases}
               containerRef={sourceScrollRef}
               lockSkillId={Boolean(lockedSkillId)}
               onToggle={toggleTarget}
@@ -2415,8 +2620,16 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                 textDiffs={textDiffs}
                 toolDescriptions={toolDescriptions}
                 toolStatuses={toolStatuses}
+                generalSkills={generalSkills}
+                tools={tools}
+                knowledgeBases={knowledgeBases}
                 containerRef={sourceScrollRef}
+                lockSkillId={Boolean(lockedSkillId)}
+                assistantPanelOpen={flowAssistantPanelOpen}
+                onAssistantPanelOpenChange={setFlowAssistantPanelOpen}
+                onFullscreenChange={setFlowFullscreen}
                 onToggle={toggleTarget}
+                onEdit={handleSourceEdit}
               />
             </div>
           )}
@@ -2696,8 +2909,12 @@ function SourceInput({
   ...rest
 }: {
   className?: string;
+  type?: HTMLInputTypeAttribute;
   value?: string;
   placeholder?: string;
+  min?: number;
+  max?: number;
+  step?: number;
   disabled?: boolean;
   readOnly?: boolean;
   style?: CSSProperties;
@@ -2710,11 +2927,14 @@ function SourceInput({
 function AutoGrowTextarea({
   className,
   minRows = 1,
+  maxRows,
   value,
+  style,
   ...rest
 }: {
   className?: string;
   minRows?: number;
+  maxRows?: number;
   value?: string;
   placeholder?: string;
   disabled?: boolean;
@@ -2723,17 +2943,46 @@ function AutoGrowTextarea({
   onChange?: ChangeEventHandler<HTMLTextAreaElement>;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
-  useEffect(() => {
+  const [autoSize, setAutoSize] = useState<{ height: number; overflowY: 'auto' | 'hidden' } | null>(null);
+  useLayoutEffect(() => {
     const el = ref.current;
-    if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = `${el.scrollHeight}px`;
-  }, [value]);
+    if (!el) return undefined;
+    const resize = () => {
+      const computed = window.getComputedStyle(el);
+      const lineHeight = Number.parseFloat(computed.lineHeight) || 20;
+      const verticalPadding = (Number.parseFloat(computed.paddingTop) || 0)
+        + (Number.parseFloat(computed.paddingBottom) || 0);
+      const verticalBorder = (Number.parseFloat(computed.borderTopWidth) || 0)
+        + (Number.parseFloat(computed.borderBottomWidth) || 0);
+      const minHeight = lineHeight * minRows + verticalPadding + verticalBorder;
+      const maxHeight = maxRows
+        ? lineHeight * Math.max(minRows, maxRows) + verticalPadding + verticalBorder
+        : Number.POSITIVE_INFINITY;
+      const nextHeight = Math.max(minHeight, Math.min(el.scrollHeight, maxHeight));
+      const nextOverflowY = maxRows || el.scrollHeight > maxHeight ? 'auto' : 'hidden';
+      setAutoSize((current) => (
+        current?.height === nextHeight && current.overflowY === nextOverflowY
+          ? current
+          : { height: nextHeight, overflowY: nextOverflowY }
+      ));
+    };
+    resize();
+    let previousWidth = el.clientWidth;
+    const observer = new ResizeObserver((entries) => {
+      const nextWidth = entries[0]?.contentRect.width ?? el.clientWidth;
+      if (Math.abs(nextWidth - previousWidth) < 0.5) return;
+      previousWidth = nextWidth;
+      resize();
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [maxRows, minRows, value]);
   return (
     <Textarea
       ref={ref}
       rows={minRows}
       value={value}
+      style={{ ...style, height: autoSize?.height, overflowY: autoSize?.overflowY }}
       className={cn(SOURCE_INPUT_CLASS, className)}
       {...rest}
     />
@@ -2831,7 +3080,7 @@ function ActionCombobox({
       <PopoverContent
         align="start"
         onOpenAutoFocus={(event) => event.preventDefault()}
-        className="max-h-[280px] w-[320px] overflow-y-auto p-[4px]"
+        className="z-[130] max-h-[280px] w-[320px] overflow-y-auto p-[4px]"
       >
         {filtered.length === 0 ? (
           <div className="px-[10px] py-[12px] text-center text-[13px] text-[#858b9c]">无匹配动作</div>
@@ -2874,7 +3123,7 @@ function SourceSelect({
       <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, className)}>
         <SelectValue placeholder={placeholder} />
       </SelectTrigger>
-      <SelectContent>
+      <SelectContent className="z-[130]">
         {options.map((option) => (
           <SelectItem key={String(option.value)} value={String(option.value)}>
             {option.label}
@@ -2894,6 +3143,9 @@ function SkillSource({
   textDiffs,
   toolDescriptions,
   toolStatuses,
+  generalSkills,
+  tools,
+  knowledgeBases,
   containerRef,
   lockSkillId,
   onToggle,
@@ -2907,6 +3159,9 @@ function SkillSource({
   textDiffs: TextDiffAnimation[];
   toolDescriptions: ToolDescriptionMap;
   toolStatuses: ToolStatusMap;
+  generalSkills: GeneralSkillRead[];
+  tools: ToolRead[];
+  knowledgeBases: KnowledgeBaseRead[];
   containerRef: RefObject<HTMLDivElement>;
   lockSkillId?: boolean;
   onToggle: (target: TargetSelection) => void;
@@ -2914,11 +3169,16 @@ function SkillSource({
 }) {
   const [deleteNodeIndex, setDeleteNodeIndex] = useState<number | null>(null);
 
-  function editBasic(field: keyof SkillCard, value: string | string[]) {
+  function editBasic(
+    field: keyof SkillCard,
+    value: string | string[] | number | null,
+  ) {
     if (field === 'skill_id' && lockSkillId) return;
     const next = cloneSkill(skill);
     if (field === 'trigger_intents' || field === 'user_utterance_examples' || field === 'goal' || field === 'required_info' || field === 'response_rules') {
-      next[field] = Array.isArray(value) ? value : splitEditableList(value);
+      next[field] = Array.isArray(value) ? value : splitEditableList(String(value ?? ''));
+    } else if (field === 'step_timeout_seconds') {
+      next.step_timeout_seconds = typeof value === 'number' ? value : null;
     } else if (field === 'skill_id' || field === 'name' || field === 'version' || field === 'business_domain' || field === 'description') {
       next[field] = String(value);
     }
@@ -2927,7 +3187,16 @@ function SkillSource({
 
   function editStep(index: number, field: string, value: string | string[] | boolean | Record<string, unknown>) {
     const next = cloneSkill(skill);
-    const listValue = field === 'expected_user_info' || field === 'allowed_actions'
+    const listValue = [
+      'expected_user_info',
+      'allowed_actions',
+      'general_skill_ids',
+      'tool_ids',
+      'knowledge_base_ids',
+      'required_general_skill_ids',
+      'required_tool_ids',
+      'required_knowledge_base_ids',
+    ].includes(field)
       ? Array.isArray(value)
         ? value
         : splitEditableList(String(value))
@@ -2961,7 +3230,22 @@ function SkillSource({
       onEdit(next, stepTargetPath(index));
       return;
     }
-    currentNode[nodeField] = listValue;
+    if (CAPABILITY_REFERENCE_FIELDS.includes(nodeField)) {
+      const currentRefs = nodeCapabilityRefs(currentNode);
+      currentNode.capability_refs = updateCapabilityRefs(
+        currentRefs,
+        nodeField,
+        asStringList(listValue),
+      );
+      delete currentNode.general_skill_ids;
+      delete currentNode.tool_ids;
+      delete currentNode.knowledge_base_ids;
+      delete currentNode.required_general_skill_ids;
+      delete currentNode.required_tool_ids;
+      delete currentNode.required_knowledge_base_ids;
+    } else {
+      currentNode[nodeField] = listValue;
+    }
     next.nodes[index] = currentNode;
     onEdit(next, stepTargetPath(index));
   }
@@ -3029,6 +3313,14 @@ function SkillSource({
       condition: '',
       expected_user_info: [],
       allowed_actions: ['continue_flow'],
+      capability_refs: {
+        general_skill_ids: [],
+        tool_ids: [],
+        knowledge_base_ids: [],
+        required_general_skill_ids: [],
+        required_tool_ids: [],
+        required_knowledge_base_ids: [],
+      },
       knowledge_scope: {},
       retry_policy: {},
       metadata: {},
@@ -3203,6 +3495,27 @@ function SkillSource({
     };
   });
   const actionOptions = buildActionOptions(toolDescriptions, toolStatuses, steps);
+  const generalSkillOptions: CapabilityReferenceOption[] = generalSkills.map((item) => ({
+    value: item.id,
+    label: item.name || item.slug,
+    description: item.description || item.slug,
+    capabilityScope: item.capability_scope,
+    unavailableReason: item.status === 'published' ? undefined : '技能未启用',
+  }));
+  const toolOptions: CapabilityReferenceOption[] = tools.map((item) => ({
+    value: item.id,
+    label: item.display_name || item.name,
+    description: item.description || item.name,
+    capabilityScope: item.capability_scope,
+    unavailableReason: item.enabled ? undefined : '工具已停用',
+  }));
+  const knowledgeBaseOptions: CapabilityReferenceOption[] = knowledgeBases.map((item) => ({
+    value: item.id,
+    label: item.name,
+    description: item.description,
+    capabilityScope: item.capability_scope,
+    unavailableReason: item.status === 'active' || item.status === 'published' ? undefined : '知识库已下线',
+  }));
 
   return (
     <div className={SOURCE_MD_CLASS} ref={containerRef}>
@@ -3225,11 +3538,19 @@ function SkillSource({
             <EditableSourceTextLine label={fieldLabel('version')} value={skill.version} onChange={(value) => editBasic('version', value)} />
             <EditableSourceTextLine label={fieldLabel('business_domain')} value={skill.business_domain || ''} onChange={(value) => editBasic('business_domain', value)} />
             <EditableSourceTextLine label={fieldLabel('description')} value={skill.description || ''} multiline onChange={(value) => editBasic('description', value)} />
+            <EditableSourceNumberLine
+              label={fieldLabel('step_timeout_seconds')}
+              value={skill.step_timeout_seconds}
+              min={1}
+              max={3600}
+              placeholder="不单独限制"
+              onChange={(value) => editBasic('step_timeout_seconds', value)}
+            />
             <EditableSourceListLine label={fieldLabel('trigger_intents')} values={skill.trigger_intents} onChange={(value) => editBasic('trigger_intents', value)} />
             <EditableSourceListLine label={fieldLabel('user_utterance_examples')} values={skill.user_utterance_examples} onChange={(value) => editBasic('user_utterance_examples', value)} />
             <EditableSourceListLine label={fieldLabel('goal')} values={skill.goal} onChange={(value) => editBasic('goal', value)} />
             <EditableSourceListLine label={fieldLabel('required_info')} values={skill.required_info} onChange={(value) => editBasic('required_info', value)} />
-            <EditableSourceListLine label={fieldLabel('response_rules')} values={skill.response_rules} onChange={(value) => editBasic('response_rules', value)} />
+            <EditableSourceListLine label={fieldLabel('response_rules')} values={skill.response_rules} minRows={5} maxRows={14} onChange={(value) => editBasic('response_rules', value)} />
           </div>
         </div>
       </SelectableTarget>
@@ -3305,6 +3626,33 @@ function SkillSource({
                       toolStatuses={toolStatuses}
                       onChange={(value) => editStep(index, 'allowed_actions', value)}
                     />
+                    <EditableCapabilityReferencesLine
+                      label="SOP 技能"
+                      values={asStringList(step.general_skill_ids)}
+                      requiredValues={asStringList(step.required_general_skill_ids)}
+                      options={generalSkillOptions}
+                      emptyText="未指定技能"
+                      onChange={(value) => editStep(index, 'general_skill_ids', value)}
+                      onRequiredChange={(value) => editStep(index, 'required_general_skill_ids', value)}
+                    />
+                    <EditableCapabilityReferencesLine
+                      label="SOP 工具"
+                      values={asStringList(step.tool_ids)}
+                      requiredValues={asStringList(step.required_tool_ids)}
+                      options={toolOptions}
+                      emptyText="未指定工具"
+                      onChange={(value) => editStep(index, 'tool_ids', value)}
+                      onRequiredChange={(value) => editStep(index, 'required_tool_ids', value)}
+                    />
+                    <EditableCapabilityReferencesLine
+                      label="SOP 知识库"
+                      values={asStringList(step.knowledge_base_ids)}
+                      requiredValues={asStringList(step.required_knowledge_base_ids)}
+                      options={knowledgeBaseOptions}
+                      emptyText="未指定知识库"
+                      onChange={(value) => editStep(index, 'knowledge_base_ids', value)}
+                      onRequiredChange={(value) => editStep(index, 'required_knowledge_base_ids', value)}
+                    />
                     <EditableFlowRulesLine
                       sourceNodeId={stepId}
                       edges={outgoingEdges}
@@ -3349,8 +3697,16 @@ function SkillFlow({
   textDiffs,
   toolDescriptions,
   toolStatuses,
+  generalSkills,
+  tools,
+  knowledgeBases,
   containerRef,
+  lockSkillId,
+  assistantPanelOpen,
+  onAssistantPanelOpenChange,
+  onFullscreenChange,
   onToggle,
+  onEdit,
 }: {
   skill: SkillCard;
   selectedPaths: string[];
@@ -3360,10 +3716,52 @@ function SkillFlow({
   textDiffs: TextDiffAnimation[];
   toolDescriptions: ToolDescriptionMap;
   toolStatuses: ToolStatusMap;
+  generalSkills: GeneralSkillRead[];
+  tools: ToolRead[];
+  knowledgeBases: KnowledgeBaseRead[];
   containerRef: RefObject<HTMLDivElement>;
+  lockSkillId?: boolean;
+  assistantPanelOpen: boolean;
+  onAssistantPanelOpenChange: (open: boolean) => void;
+  onFullscreenChange: (open: boolean) => void;
   onToggle: (target: TargetSelection) => void;
+  onEdit: (nextDraft: SkillCard, path: string) => void;
 }) {
   const [flowZoom, setFlowZoom] = useState(0.64);
+  const [flowPreset, setFlowPreset] = useState<'fit' | '100' | null>('fit');
+  const [flowPan, setFlowPan] = useState({ x: 0, y: 0 });
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [selectedNodeIndex, setSelectedNodeIndex] = useState<number | null>(null);
+  const [basicInspectorOpen, setBasicInspectorOpen] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [flowViewportWidth, setFlowViewportWidth] = useState(0);
+  const [armedConnectionSourceId, setArmedConnectionSourceId] = useState('');
+  const [selectedEdgeId, setSelectedEdgeId] = useState('');
+  const [hoveredEdgeId, setHoveredEdgeId] = useState('');
+  const [nodePositionOverrides, setNodePositionOverrides] = useState<Record<string, SkillFlowPosition>>({});
+  const [connectionDrag, setConnectionDrag] = useState<SkillFlowConnectionPreview | null>(null);
+  const fullscreenButtonRef = useRef<HTMLButtonElement>(null);
+  const connectionPointerRef = useRef<{ sourceNodeId: string; startX: number; startY: number } | null>(null);
+  const connectionDragRef = useRef<typeof connectionDrag>(null);
+  const nodeDragRef = useRef<{
+    pointerId: number;
+    nodeId: string;
+    nodeIndex: number;
+    pointerX: number;
+    pointerY: number;
+    startX: number;
+    startY: number;
+    moved: boolean;
+    captureTarget: HTMLDivElement;
+  } | null>(null);
+  const suppressNodeClickRef = useRef('');
+  const panStateRef = useRef<{
+    pointerId: number;
+    x: number;
+    y: number;
+    panX: number;
+    panY: number;
+  } | null>(null);
   const nodes = skillGraphSteps(skill);
   const edgeMap = skillGraphEdgeMap(skill);
   const terminalSet = new Set(asStringList(skill.terminal_node_ids));
@@ -3375,14 +3773,276 @@ function SkillFlow({
   );
   const graphKey = `${skill.skill_id || 'skill'}:${skill.version || 'draft'}:${nodes.length}:${skill.start_node_id || ''}`;
   const centeredGraphKey = useRef('');
-  const graphLayout = buildSkillFlowCanvasLayout(skill, nodes, nodeNameMap);
+  const graphLayout = buildSkillFlowCanvasLayout(skill, nodes, nodeNameMap, nodePositionOverrides);
   const zoomedWidth = graphLayout.width * flowZoom;
   const zoomedHeight = graphLayout.height * flowZoom;
-  const updateZoom = (nextZoom: number) => {
-    const next = Math.min(1.18, Math.max(0.54, Math.round(nextZoom * 100) / 100));
+  const canvasWidth = Math.max(zoomedWidth, flowViewportWidth);
+  const canvasOffsetX = Math.max(0, (canvasWidth - zoomedWidth) / 2);
+  const selectedNode = selectedNodeIndex === null ? null : nodes[selectedNodeIndex] || null;
+  const selectedNodeId = selectedNodeIndex === null
+    ? ''
+    : String(selectedNode?.node_id || selectedNode?.step_id || `node_${selectedNodeIndex + 1}`);
+  const nodeOptions = nodes.map((node, index) => {
+    const nodeId = String(node.node_id || node.step_id || `node_${index + 1}`);
+    return { value: nodeId, label: `Node ${index + 1} · ${String(node.name || nodeId)}` };
+  });
+  const actionOptions = buildActionOptions(toolDescriptions, toolStatuses, nodes);
+  const generalSkillOptions: CapabilityReferenceOption[] = generalSkills.map((item) => ({
+    value: item.id,
+    label: item.name || item.slug,
+    description: item.description || item.slug,
+    capabilityScope: item.capability_scope,
+    unavailableReason: item.status === 'published' ? undefined : '技能未启用',
+  }));
+  const toolOptions: CapabilityReferenceOption[] = tools.map((item) => ({
+    value: item.id,
+    label: item.display_name || item.name,
+    description: item.description || item.name,
+    capabilityScope: item.capability_scope,
+    unavailableReason: item.enabled ? undefined : '工具已停用',
+  }));
+  const knowledgeBaseOptions: CapabilityReferenceOption[] = knowledgeBases.map((item) => ({
+    value: item.id,
+    label: item.name,
+    description: item.description,
+    capabilityScope: item.capability_scope,
+    unavailableReason: item.status === 'active' || item.status === 'published' ? undefined : '知识库已下线',
+  }));
+
+  const editFlowNode = (
+    index: number,
+    field: string,
+    value: string | string[] | boolean | Record<string, unknown>,
+  ) => {
+    const next = cloneSkill(skill);
+    const listValue = [
+      'expected_user_info',
+      'allowed_actions',
+      'general_skill_ids',
+      'tool_ids',
+      'knowledge_base_ids',
+      'required_general_skill_ids',
+      'required_tool_ids',
+      'required_knowledge_base_ids',
+    ].includes(field)
+      ? Array.isArray(value) ? value : splitEditableList(String(value))
+      : value;
+    next.nodes = Array.isArray(next.nodes) ? [...next.nodes] : [];
+    const currentNode = { ...(next.nodes[index] || {}) };
+    const nodeField = field === 'step_id' ? 'node_id' : field;
+    if (nodeField === 'node_id') {
+      const previousId = String(currentNode.node_id || currentNode.step_id || `node_${index + 1}`);
+      const nextId = String(listValue || '').trim();
+      if (!nextId) {
+        notify.warning('节点 ID 不能为空');
+        return;
+      }
+      const duplicated = next.nodes.some((node, nodeIndex) => (
+        nodeIndex !== index && String(node?.node_id || node?.step_id || '') === nextId
+      ));
+      if (duplicated) {
+        notify.warning(`节点 ID「${nextId}」已经存在`);
+        return;
+      }
+      currentNode.node_id = nextId;
+      next.edges = normalizeSkillEdges(next).map((edge) => ({
+        ...edge,
+        source_node_id: String(edge.source_node_id || '') === previousId ? nextId : edge.source_node_id,
+        next_node_id: String(edge.next_node_id || '') === previousId ? nextId : edge.next_node_id,
+      }));
+      if (next.start_node_id === previousId) next.start_node_id = nextId;
+      next.terminal_node_ids = asStringList(next.terminal_node_ids).map((nodeId) => (nodeId === previousId ? nextId : nodeId));
+    } else if (CAPABILITY_REFERENCE_FIELDS.includes(nodeField)) {
+      const currentRefs = nodeCapabilityRefs(currentNode);
+      currentNode.capability_refs = updateCapabilityRefs(
+        currentRefs,
+        nodeField,
+        asStringList(listValue),
+      );
+      delete currentNode.general_skill_ids;
+      delete currentNode.tool_ids;
+      delete currentNode.knowledge_base_ids;
+      delete currentNode.required_general_skill_ids;
+      delete currentNode.required_tool_ids;
+      delete currentNode.required_knowledge_base_ids;
+    } else {
+      currentNode[nodeField] = listValue;
+    }
+    next.nodes[index] = currentNode;
+    onEdit(next, stepTargetPath(index));
+  };
+
+  const editFlowBasic = (
+    field: keyof SkillCard,
+    value: string | string[] | number | null,
+  ) => {
+    if (field === 'skill_id' && lockSkillId) return;
+    const next = cloneSkill(skill);
+    if (field === 'trigger_intents' || field === 'user_utterance_examples' || field === 'goal' || field === 'required_info' || field === 'response_rules') {
+      next[field] = Array.isArray(value) ? value : splitEditableList(String(value ?? ''));
+    } else if (field === 'step_timeout_seconds') {
+      next.step_timeout_seconds = typeof value === 'number' ? value : null;
+    } else if (field === 'skill_id' || field === 'name' || field === 'version' || field === 'business_domain' || field === 'description') {
+      next[field] = String(value);
+    }
+    onEdit(next, 'basic');
+  };
+
+  const updateFlowEdge = (index: number, edgeIndex: number, patch: Record<string, unknown>) => {
+    const next = cloneSkill(skill);
+    const sourceId = nodeIdAt(next, index);
+    const edges = normalizeSkillEdges(next);
+    const globalIndex = findSourceEdgeIndex(edges, sourceId, edgeIndex);
+    if (globalIndex < 0) return;
+    edges[globalIndex] = { ...edges[globalIndex], ...patch };
+    next.edges = edges;
+    onEdit(next, stepTargetPath(index));
+  };
+
+  const addFlowEdge = (index: number) => {
+    const next = cloneSkill(skill);
+    const sourceId = nodeIdAt(next, index);
+    const target = nodes.find((node, nodeIndex) => nodeIndex !== index && String(node.node_id || node.step_id || ''));
+    const targetId = String(target?.node_id || target?.step_id || '');
+    const sourceEdges = normalizeSkillEdges(next).filter((edge) => String(edge.source_node_id || '') === sourceId);
+    const priority = sourceEdges.length > 0
+      ? Math.max(...sourceEdges.map((edge, sourceIndex) => edgePriority(edge, sourceIndex))) + 1
+      : 1;
+    next.edges = [...normalizeSkillEdges(next), {
+      source_node_id: sourceId,
+      next_node_id: targetId,
+      condition: '',
+      priority,
+      label: targetId ? '新增流转' : '',
+    }];
+    onEdit(next, stepTargetPath(index));
+  };
+
+  const deleteFlowEdge = (index: number, edgeIndex: number) => {
+    const next = cloneSkill(skill);
+    const sourceId = nodeIdAt(next, index);
+    const edges = normalizeSkillEdges(next);
+    const globalIndex = findSourceEdgeIndex(edges, sourceId, edgeIndex);
+    if (globalIndex < 0) return;
+    edges.splice(globalIndex, 1);
+    next.edges = edges;
+    onEdit(next, stepTargetPath(index));
+  };
+
+  const connectFlowNodes = (sourceNodeId: string, targetNodeId: string) => {
+    if (!sourceNodeId || !targetNodeId || sourceNodeId === targetNodeId) return;
+    const next = cloneSkill(skill);
+    const edges = normalizeSkillEdges(next);
+    if (edges.some((edge) => (
+      String(edge.source_node_id || '') === sourceNodeId && String(edge.next_node_id || '') === targetNodeId
+    ))) {
+      notify.warning('这两个节点之间已经存在流转规则');
+      return;
+    }
+    const sourceIndex = nodes.findIndex((node, index) => String(node.node_id || node.step_id || `node_${index + 1}`) === sourceNodeId);
+    const targetName = nodeNameMap[targetNodeId] || targetNodeId;
+    const sourceEdges = edges.filter((edge) => String(edge.source_node_id || '') === sourceNodeId);
+    const priority = sourceEdges.length > 0
+      ? Math.max(...sourceEdges.map((edge, edgeIndex) => edgePriority(edge, edgeIndex))) + 1
+      : 1;
+    next.edges = [...edges, {
+      source_node_id: sourceNodeId,
+      next_node_id: targetNodeId,
+      condition: '',
+      priority,
+      label: `连接到 ${targetName}`,
+    }];
+    if (sourceIndex >= 0) setSelectedNodeIndex(sourceIndex);
+    onEdit(next, stepTargetPath(Math.max(sourceIndex, 0)));
+    notify.success(`已连接到「${targetName}」，右侧流转规则已同步`);
+  };
+  const deleteFlowEdgeAt = (edgeIndex: number) => {
+    const edge = normalizeSkillEdges(skill)[edgeIndex];
+    if (!edge) return;
+    const sourceNodeId = String(edge.source_node_id || '');
+    const targetNodeId = String(edge.next_node_id || '');
+    const sourceIndex = nodes.findIndex((node, index) => (
+      String(node.node_id || node.step_id || `node_${index + 1}`) === sourceNodeId
+    ));
+    onEdit(withoutSkillEdgeAt(skill, edgeIndex), stepTargetPath(Math.max(sourceIndex, 0)));
+    setSelectedEdgeId('');
+    notify.success(`已删除「${nodeNameMap[sourceNodeId] || sourceNodeId} → ${nodeNameMap[targetNodeId] || targetNodeId}」流转`);
+  };
+  const startNodeDrag = (
+    event: ReactPointerEvent<HTMLDivElement>,
+    node: SkillFlowCanvasNode,
+  ) => {
+    if (event.button !== 0 || connectionDrag || armedConnectionSourceId) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('button, input, textarea, select, [role="combobox"], [data-flow-connect-handle]')) return;
+    nodeDragRef.current = {
+      pointerId: event.pointerId,
+      nodeId: node.nodeId,
+      nodeIndex: node.index,
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      startX: node.x,
+      startY: node.y,
+      moved: false,
+      captureTarget: event.currentTarget,
+    };
+  };
+  const handleNodePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = nodeDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const deltaX = (event.clientX - drag.pointerX) / flowZoom;
+    const deltaY = (event.clientY - drag.pointerY) / flowZoom;
+    if (!drag.moved && Math.hypot(deltaX, deltaY) < 4) return;
+    if (!drag.moved && !drag.captureTarget.hasPointerCapture(drag.pointerId)) {
+      drag.captureTarget.setPointerCapture(drag.pointerId);
+    }
+    drag.moved = true;
+    const position = {
+      x: Math.max(32, drag.startX + deltaX),
+      y: Math.max(32, drag.startY + deltaY),
+    };
+    setFlowPreset(null);
+    setNodePositionOverrides((current) => ({ ...current, [drag.nodeId]: position }));
+  };
+  const finishNodeDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = nodeDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    nodeDragRef.current = null;
+    if (drag.captureTarget.hasPointerCapture(drag.pointerId)) {
+      drag.captureTarget.releasePointerCapture(drag.pointerId);
+    }
+    if (!drag.moved) return;
+    const position = {
+      x: Math.max(32, drag.startX + (event.clientX - drag.pointerX) / flowZoom),
+      y: Math.max(32, drag.startY + (event.clientY - drag.pointerY) / flowZoom),
+    };
+    setNodePositionOverrides((current) => ({ ...current, [drag.nodeId]: position }));
+    suppressNodeClickRef.current = drag.nodeId;
+    onEdit(withSkillNodeFlowPosition(skill, drag.nodeIndex, position), stepTargetPath(drag.nodeIndex));
+  };
+  const updateZoom = (
+    nextZoom: number,
+    preset: 'fit' | '100' | null = null,
+    minimumZoom = isFullscreen ? 0.2 : 0.36,
+  ) => {
+    const next = Math.min(1.18, Math.max(minimumZoom, Math.round(nextZoom * 100) / 100));
     const container = containerRef.current;
+    setFlowPreset(preset);
     if (!container) {
       setFlowZoom(next);
+      return;
+    }
+    if (isFullscreen) {
+      const centerX = container.clientWidth / 2;
+      const centerY = container.clientHeight / 2;
+      const graphX = (centerX - flowPan.x) / flowZoom;
+      const graphY = (centerY - flowPan.y) / flowZoom;
+      setFlowPreset(preset);
+      setFlowZoom(next);
+      setFlowPan({
+        x: centerX - graphX * next,
+        y: centerY - graphY * next,
+      });
       return;
     }
     const centerX = (container.scrollLeft + container.clientWidth / 2) / flowZoom;
@@ -3393,9 +4053,283 @@ function SkillFlow({
       container.scrollTop = Math.max(0, centerY * next - container.clientHeight / 2);
     });
   };
+  const fitFlowToViewport = (fullscreenMode = isFullscreen) => {
+    const container = containerRef.current;
+    if (!container) {
+      updateZoom(0.64, 'fit');
+      return;
+    }
+    const horizontalGutter = fullscreenMode ? 72 : 48;
+    const verticalGutter = fullscreenMode ? 72 : 48;
+    const availableWidth = Math.max(240, container.clientWidth - horizontalGutter);
+    const availableHeight = Math.max(240, container.clientHeight - verticalGutter);
+    const nextZoom = Math.min(
+      1,
+      availableWidth / graphLayout.width,
+      availableHeight / graphLayout.height,
+    );
+    const normalizedZoom = Math.min(1, Math.max(0.2, Math.round(nextZoom * 100) / 100));
+    setFlowPreset('fit');
+    setFlowZoom(normalizedZoom);
+    if (fullscreenMode) {
+      setFlowPan({
+        x: (container.clientWidth - graphLayout.width * normalizedZoom) / 2,
+        y: (container.clientHeight - graphLayout.height * normalizedZoom) / 2,
+      });
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      const rootCenterX = (graphLayout.root.x + graphLayout.root.width / 2) * normalizedZoom;
+      container.scrollLeft = Math.max(0, rootCenterX - container.clientWidth / 2);
+      container.scrollTop = 0;
+    });
+  };
+  const focusFlowStart = () => {
+    const container = containerRef.current;
+    if (!container) return;
+    const nextZoom = 0.72;
+    setFlowPreset(null);
+    setFlowZoom(nextZoom);
+    setFlowPan({
+      x: container.clientWidth / 2 - (graphLayout.root.x + graphLayout.root.width / 2) * nextZoom,
+      y: 44 - graphLayout.root.y * nextZoom,
+    });
+  };
+  const toggleFullscreen = () => {
+    const nextFullscreen = !isFullscreen;
+    setIsFullscreen(nextFullscreen);
+    onFullscreenChange(nextFullscreen);
+    if (nextFullscreen) {
+      onAssistantPanelOpenChange(true);
+      setInspectorOpen(true);
+    }
+    if (nextFullscreen && selectedNodeIndex === null && nodes.length > 0) setSelectedNodeIndex(0);
+    if (!nextFullscreen) {
+      connectionPointerRef.current = null;
+      connectionDragRef.current = null;
+      setConnectionDrag(null);
+      setArmedConnectionSourceId('');
+    }
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (nextFullscreen) focusFlowStart();
+        else fitFlowToViewport(false);
+        fullscreenButtonRef.current?.focus();
+      });
+    });
+  };
+  const startConnectionDrag = (event: ReactPointerEvent<HTMLButtonElement>, sourceNodeId: string) => {
+    if (!isFullscreen) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const startX = rect.left + rect.width / 2;
+    const startY = rect.top + rect.height / 2;
+    setArmedConnectionSourceId('');
+    connectionPointerRef.current = { sourceNodeId, startX, startY };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const armConnectionClick = (event: MouseEvent<HTMLButtonElement>, sourceNodeId: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setArmedConnectionSourceId(sourceNodeId);
+  };
+  const handleConnectionPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pending = connectionPointerRef.current;
+    if (!pending) return;
+    const moved = Math.hypot(event.clientX - pending.startX, event.clientY - pending.startY);
+    if (!connectionDragRef.current && moved < 4) return;
+    const hoveredNode = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-flow-node-id]');
+    const hoveredNodeId = hoveredNode?.dataset.flowNodeId || '';
+    const targetNodeId = hoveredNodeId && hoveredNodeId !== pending.sourceNodeId ? hoveredNodeId : '';
+    const targetRect = targetNodeId ? hoveredNode?.getBoundingClientRect() : null;
+    const nextDrag = {
+      sourceNodeId: pending.sourceNodeId,
+      targetNodeId,
+      startX: pending.startX,
+      startY: pending.startY,
+      currentX: targetRect ? targetRect.left + targetRect.width / 2 : event.clientX,
+      currentY: targetRect ? targetRect.top - 2 : event.clientY,
+    };
+    connectionDragRef.current = nextDrag;
+    setConnectionDrag(nextDrag);
+  };
+  const handleConnectionPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pending = connectionPointerRef.current;
+    const drag = connectionDragRef.current;
+    if (!pending) return;
+    connectionPointerRef.current = null;
+    connectionDragRef.current = null;
+    setConnectionDrag(null);
+    if (!drag) {
+      setArmedConnectionSourceId((current) => current === pending.sourceNodeId ? '' : pending.sourceNodeId);
+      return;
+    }
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-flow-node-id]');
+    const targetNodeId = drag.targetNodeId || target?.dataset.flowNodeId || '';
+    if (targetNodeId) connectFlowNodes(drag.sourceNodeId, targetNodeId);
+  };
+  const handlePanPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!isFullscreen || connectionDrag || event.button !== 0) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('[data-flow-node-id], [data-flow-edge-hit], button, input, textarea, select, [role="button"], [role="combobox"]')) return;
+    panStateRef.current = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      panX: flowPan.x,
+      panY: flowPan.y,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const handlePanPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pan = panStateRef.current;
+    if (!pan || pan.pointerId !== event.pointerId) return;
+    setFlowPan({
+      x: pan.panX + event.clientX - pan.x,
+      y: pan.panY + event.clientY - pan.y,
+    });
+  };
+  const stopPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (panStateRef.current?.pointerId !== event.pointerId) return;
+    panStateRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+  const scheduleConnectionPreviewReanchor = () => {
+    const pending = connectionPointerRef.current;
+    if (!pending) return;
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const latestPending = connectionPointerRef.current;
+        if (!latestPending) return;
+        const container = containerRef.current;
+        const nodeElements = container?.querySelectorAll<HTMLElement>('[data-flow-node-id]');
+        const findNode = (nodeId: string) => Array.from(nodeElements || [])
+          .find((node) => node.dataset.flowNodeId === nodeId);
+        const sourceHandle = findNode(latestPending.sourceNodeId)
+          ?.querySelector<HTMLElement>('[data-flow-connect-handle]');
+        const sourceRect = sourceHandle?.getBoundingClientRect();
+        if (!sourceRect) return;
+        const sourcePoint = {
+          x: sourceRect.left + sourceRect.width / 2,
+          y: sourceRect.top + sourceRect.height / 2,
+        };
+        connectionPointerRef.current = {
+          ...latestPending,
+          startX: sourcePoint.x,
+          startY: sourcePoint.y,
+        };
+        const current = connectionDragRef.current;
+        if (!current) return;
+        const targetRect = current.targetNodeId
+          ? findNode(current.targetNodeId)?.getBoundingClientRect()
+          : null;
+        const next = reanchorSkillFlowConnection(
+          current,
+          sourcePoint,
+          targetRect
+            ? { x: targetRect.left + targetRect.width / 2, y: targetRect.top - 2 }
+            : undefined,
+        );
+        connectionDragRef.current = next;
+        setConnectionDrag(next);
+      });
+    });
+  };
+  const handleCanvasWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    if (!isFullscreen) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.ctrlKey || event.metaKey) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left;
+      const pointerY = event.clientY - rect.top;
+      const graphX = (pointerX - flowPan.x) / flowZoom;
+      const graphY = (pointerY - flowPan.y) / flowZoom;
+      const multiplier = event.deltaY > 0 ? 0.9 : 1.1;
+      const nextZoom = Math.min(1.18, Math.max(0.2, Math.round(flowZoom * multiplier * 100) / 100));
+      setFlowPreset(null);
+      setFlowZoom(nextZoom);
+      setFlowPan({
+        x: pointerX - graphX * nextZoom,
+        y: pointerY - graphY * nextZoom,
+      });
+      scheduleConnectionPreviewReanchor();
+      return;
+    }
+    const deltaX = normalizeSkillFlowWheelDelta(event.deltaX, event.deltaMode, event.currentTarget.clientWidth);
+    const deltaY = normalizeSkillFlowWheelDelta(event.deltaY, event.deltaMode, event.currentTarget.clientHeight);
+    setFlowPreset(null);
+    setFlowPan((current) => ({
+      x: current.x - deltaX,
+      y: current.y - deltaY,
+    }));
+    scheduleConnectionPreviewReanchor();
+  };
   useEffect(() => {
     const container = containerRef.current;
-    if (!container || centeredGraphKey.current === graphKey) return undefined;
+    if (!container) return undefined;
+    const updateWidth = () => setFlowViewportWidth(container.clientWidth);
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [containerRef, isFullscreen]);
+  useEffect(() => {
+    if (nodes.length === 0) {
+      if (selectedNodeIndex !== null) setSelectedNodeIndex(null);
+      return;
+    }
+    if (selectedNodeIndex !== null && selectedNodeIndex >= nodes.length) setSelectedNodeIndex(nodes.length - 1);
+  }, [nodes.length, selectedNodeIndex]);
+  useEffect(() => {
+    setNodePositionOverrides({});
+    setSelectedEdgeId('');
+  }, [skill.skill_id]);
+  useEffect(() => {
+    const visibleEdgeIds = new Set(graphLayout.edges.map((edge) => edge.id));
+    if (selectedEdgeId && !visibleEdgeIds.has(selectedEdgeId)) setSelectedEdgeId('');
+  }, [graphLayout.edges, selectedEdgeId]);
+  useEffect(() => {
+    if (!isFullscreen) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if ((event.key === 'Delete' || event.key === 'Backspace') && selectedEdgeId) {
+        const target = event.target as HTMLElement | null;
+        if (target?.closest('input, textarea, select, [contenteditable="true"]')) return;
+        const selectedEdge = graphLayout.edges.find((edge) => edge.id === selectedEdgeId);
+        if (selectedEdge?.edgeIndex !== undefined) {
+          event.preventDefault();
+          deleteFlowEdgeAt(selectedEdge.edgeIndex);
+        }
+        return;
+      }
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      if (connectionDrag) {
+        connectionPointerRef.current = null;
+        connectionDragRef.current = null;
+        setConnectionDrag(null);
+        return;
+      }
+      if (armedConnectionSourceId) {
+        setArmedConnectionSourceId('');
+        return;
+      }
+      setIsFullscreen(false);
+      onFullscreenChange(false);
+      window.requestAnimationFrame(() => fullscreenButtonRef.current?.focus());
+    };
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [armedConnectionSourceId, connectionDrag, graphLayout.edges, isFullscreen, onFullscreenChange, selectedEdgeId]);
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || isFullscreen || centeredGraphKey.current === graphKey) return undefined;
     centeredGraphKey.current = graphKey;
     const frame = window.requestAnimationFrame(() => {
       const rootCenterX = (graphLayout.root.x + graphLayout.root.width / 2) * flowZoom;
@@ -3404,85 +4338,259 @@ function SkillFlow({
       container.scrollTop = 0;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [containerRef, flowZoom, graphKey, graphLayout.root.x, graphLayout.root.width]);
-  const isFitZoom = Math.abs(flowZoom - 0.64) < 0.001;
-  const isFullZoom = Math.abs(flowZoom - 1) < 0.001;
+  }, [containerRef, flowZoom, graphKey, graphLayout.root.x, graphLayout.root.width, isFullscreen]);
+  const isFitZoom = flowPreset === 'fit';
+  const isFullZoom = flowPreset === '100' && Math.abs(flowZoom - 1) < 0.001;
   return (
-    <>
-      <div className={FLOW_ZOOM_TOOLBAR_CLASS} aria-label="流程图缩放">
-        <span className="shrink-0">缩放</span>
-        <UIButton variant="outline" size="sm" className={FLOW_ZOOM_STEP_BUTTON_CLASS} onClick={() => updateZoom(flowZoom - 0.08)} aria-label="缩小">
-          -
-        </UIButton>
-        <span className={FLOW_ZOOM_VALUE_CLASS}>{Math.round(flowZoom * 100)}%</span>
-        <UIButton variant="outline" size="sm" className={FLOW_ZOOM_STEP_BUTTON_CLASS} onClick={() => updateZoom(flowZoom + 0.08)} aria-label="放大">
-          +
-        </UIButton>
-        <UIButton
-          variant="outline"
-          size="sm"
-          className={flowZoomPresetButtonClass(isFitZoom)}
-          aria-pressed={isFitZoom}
-          onClick={() => updateZoom(0.64)}
-        >
-          适配
-        </UIButton>
-        <UIButton
-          variant="outline"
-          size="sm"
-          className={flowZoomPresetButtonClass(isFullZoom)}
-          aria-pressed={isFullZoom}
-          onClick={() => updateZoom(1)}
-        >
-          100%
-        </UIButton>
-      </div>
-      <div className={FLOW_CLASS} ref={containerRef}>
+    <div
+      className={cn(FLOW_VIEWER_CLASS, isFullscreen && FLOW_VIEWER_FULLSCREEN_CLASS)}
+      role={isFullscreen ? 'dialog' : undefined}
+      aria-modal={isFullscreen || undefined}
+      aria-label={isFullscreen ? 'SOP 流程图全屏查看' : undefined}
+      onPointerMove={(event) => {
+        handleConnectionPointerMove(event);
+        handleNodePointerMove(event);
+      }}
+      onPointerUp={(event) => {
+        handleConnectionPointerUp(event);
+        finishNodeDrag(event);
+      }}
+      onPointerCancel={(event) => {
+        handleConnectionPointerUp(event);
+        finishNodeDrag(event);
+      }}
+    >
+      <div className={cn(FLOW_VIEWER_CLASS, isFullscreen && FLOW_VIEWER_FULLSCREEN_PANEL_CLASS)}>
+        <div className={cn(FLOW_ZOOM_TOOLBAR_CLASS, isFullscreen && FLOW_ZOOM_TOOLBAR_FULLSCREEN_CLASS)} aria-label="流程图控制">
+          {isFullscreen && (
+            <div className={FLOW_VIEWER_TITLE_CLASS}>
+              <span className={FLOW_VIEWER_TITLE_MARK_CLASS}><BranchesOutlined /></span>
+              <span className="grid min-w-0 gap-[2px]">
+                <strong className="truncate text-[14px] font-medium text-[#18181a]">{skill.name || 'SOP 流程图'}</strong>
+                <span className={FLOW_VIEWER_TITLE_META_CLASS}>
+                  {nodes.length} 个节点 · {graphLayout.edges.length} 条连线 · {armedConnectionSourceId ? '点击目标节点完成连接' : '拖动节点调整排版，选择连线可删除'}
+                </span>
+              </span>
+            </div>
+          )}
+          <div className={FLOW_ZOOM_CONTROLS_CLASS}>
+            {isFullscreen && (
+              <>
+                <UIButton
+                  variant="outline"
+                  size="sm"
+                  className={flowZoomPresetButtonClass(assistantPanelOpen)}
+                  aria-pressed={assistantPanelOpen}
+                  onClick={() => {
+                    onAssistantPanelOpenChange(!assistantPanelOpen);
+                  }}
+                >
+                  {assistantPanelOpen ? <PanelLeftClose /> : <PanelLeftOpen />}
+                  AI 修改
+                </UIButton>
+                <UIButton
+                  variant="outline"
+                  size="sm"
+                  className={flowZoomPresetButtonClass(inspectorOpen)}
+                  aria-pressed={inspectorOpen}
+                  onClick={() => {
+                    setInspectorOpen((current) => !current);
+                  }}
+                >
+                  {inspectorOpen ? <PanelRightClose /> : <PanelRightOpen />}
+                  结构编辑
+                </UIButton>
+              </>
+            )}
+            <span className="shrink-0">缩放</span>
+            <UIButton variant="outline" size="sm" className={FLOW_ZOOM_STEP_BUTTON_CLASS} onClick={() => updateZoom(flowZoom - 0.08)} aria-label="缩小">
+              -
+            </UIButton>
+            <span className={FLOW_ZOOM_VALUE_CLASS}>{Math.round(flowZoom * 100)}%</span>
+            <UIButton variant="outline" size="sm" className={FLOW_ZOOM_STEP_BUTTON_CLASS} onClick={() => updateZoom(flowZoom + 0.08)} aria-label="放大">
+              +
+            </UIButton>
+            <UIButton
+              variant="outline"
+              size="sm"
+              className={flowZoomPresetButtonClass(isFitZoom)}
+              aria-pressed={isFitZoom}
+              onClick={() => fitFlowToViewport()}
+            >
+              适配
+            </UIButton>
+            <UIButton
+              variant="outline"
+              size="sm"
+              className={flowZoomPresetButtonClass(isFullZoom)}
+              aria-pressed={isFullZoom}
+              onClick={() => updateZoom(1, '100')}
+            >
+              100%
+            </UIButton>
+            <UIButton
+              ref={fullscreenButtonRef}
+              variant="outline"
+              size="sm"
+              className={CARD_OUTLINE_BUTTON_CLASS}
+              onClick={toggleFullscreen}
+              aria-label={isFullscreen ? '退出全屏' : '全屏查看流程图'}
+            >
+              {isFullscreen ? <Minimize2 /> : <Maximize2 />}
+              {isFullscreen ? '退出全屏' : '全屏查看'}
+            </UIButton>
+          </div>
+        </div>
+        <div className={FLOW_VIEWER_BODY_CLASS}>
         <div
-          className={FLOW_ZOOM_SHELL_CLASS}
-          style={{ width: zoomedWidth, height: zoomedHeight }}
+          className={cn(
+            FLOW_CLASS,
+            isFullscreen && FLOW_FULLSCREEN_CLASS,
+            isFullscreen && FLOW_FULLSCREEN_PANNABLE_CLASS,
+            isFullscreen && assistantPanelOpen && FLOW_FULLSCREEN_WITH_AI_CLASS,
+          )}
+          ref={containerRef}
+          onPointerDown={handlePanPointerDown}
+          onPointerMove={handlePanPointerMove}
+          onPointerUp={stopPan}
+          onPointerCancel={stopPan}
+          onWheel={handleCanvasWheel}
+          aria-label={isFullscreen ? 'SOP 流程图画布，可拖拽空白区域移动' : undefined}
+          style={isFullscreen ? { backgroundPosition: `${flowPan.x}px ${flowPan.y}px` } : undefined}
+        >
+        <div
+          className={cn(FLOW_ZOOM_SHELL_CLASS, isFullscreen && 'h-full! min-w-0! w-full!')}
+          style={isFullscreen ? { width: '100%', height: '100%' } : { width: canvasWidth, height: zoomedHeight }}
         >
           <div
-            className={FLOW_GRAPH_CANVAS_CLASS}
+            className={cn(FLOW_GRAPH_CANVAS_CLASS, isFullscreen && 'rounded-none bg-none')}
             style={{
+              top: isFullscreen ? flowPan.y : 0,
+              left: isFullscreen ? flowPan.x : canvasOffsetX,
               width: graphLayout.width,
               height: graphLayout.height,
               transform: `scale(${flowZoom})`,
             }}
           >
             <svg
-              className={FLOW_EDGES_CLASS}
+              className={cn(FLOW_EDGES_CLASS, 'pointer-events-auto')}
               width={graphLayout.width}
               height={graphLayout.height}
               viewBox={`0 0 ${graphLayout.width} ${graphLayout.height}`}
-              aria-hidden="true"
+              aria-label="SOP 流程连线"
             >
               <defs>
                 <marker id="skill-flow-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-                  <path d="M 0 0 L 10 5 L 0 10 z" />
+                  <path d="M 0 0 L 10 5 L 0 10 z" fill="#4e716d" />
                 </marker>
               </defs>
               {graphLayout.edges.map((edge) => (
-                <path
-                  className={FLOW_EDGE_PATH_CLASS}
-                  d={edge.path}
-                  key={edge.id}
-                  markerEnd="url(#skill-flow-arrow)"
-                  strokeDasharray="6 14"
-                >
-                  <title>{edge.title}</title>
-                </path>
+                <g key={edge.id}>
+                  <path
+                    className={cn(
+                      FLOW_EDGE_PATH_CLASS,
+                      'pointer-events-none',
+                      hoveredEdgeId === edge.id && 'stroke-[#4f817c]! [stroke-width:2.15] opacity-100',
+                      selectedEdgeId === edge.id && 'stroke-[#04756f]! [stroke-width:2.5] opacity-100',
+                    )}
+                    d={edge.path}
+                    markerEnd="url(#skill-flow-arrow)"
+                    aria-hidden="true"
+                  >
+                    <title>{edge.title}</title>
+                  </path>
+                  {edge.kind === 'edge' && (
+                    <path
+                      d={edge.path}
+                      fill="none"
+                      stroke="rgba(4, 117, 111, 0.001)"
+                      strokeWidth="28"
+                      vectorEffect="non-scaling-stroke"
+                      pointerEvents="stroke"
+                      data-flow-edge-hit={edge.id}
+                      className="cursor-pointer [pointer-events:stroke]"
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`选择流转 ${edge.title}`}
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onPointerEnter={() => setHoveredEdgeId(edge.id)}
+                      onPointerLeave={() => setHoveredEdgeId((current) => current === edge.id ? '' : current)}
+                      onFocus={() => setHoveredEdgeId(edge.id)}
+                      onBlur={() => setHoveredEdgeId((current) => current === edge.id ? '' : current)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setSelectedEdgeId(edge.id);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key !== 'Enter' && event.key !== ' ') return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setSelectedEdgeId(edge.id);
+                      }}
+                    />
+                  )}
+                </g>
               ))}
             </svg>
             {graphLayout.edges.map((edge) => (
-              <span
-                className={flowEdgeLabelClass(edge.labelTone || edge.kind)}
+              <div
+                className={cn(
+                  flowEdgeLabelClass(edge.labelTone || edge.kind),
+                  edge.kind === 'edge' && 'pointer-events-auto! flex cursor-pointer items-center gap-[5px] overflow-visible!',
+                  selectedEdgeId === edge.id && 'border-[#04756f]! bg-[#f3fbf8]! text-[#075f59]!',
+                )}
                 key={`${edge.id}_label`}
-                style={{ left: edge.labelX, top: edge.labelY }}
+                data-flow-edge-label={edge.id}
+                style={{
+                  left: edge.labelX,
+                  top: edge.labelY,
+                  ...(isFullscreen
+                    ? {
+                        transform: `translate(-50%, -50%) scale(${1 / flowZoom})`,
+                        transformOrigin: 'center',
+                      }
+                    : {}),
+                }}
                 title={edge.title}
+                onPointerEnter={() => setHoveredEdgeId(edge.id)}
+                onPointerLeave={() => setHoveredEdgeId((current) => current === edge.id ? '' : current)}
+                onFocusCapture={() => setHoveredEdgeId(edge.id)}
+                onBlurCapture={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget)) setHoveredEdgeId('');
+                }}
               >
-                {edge.label}
-              </span>
+                {edge.kind === 'edge' ? (
+                  <button
+                    type="button"
+                    className="min-w-0 cursor-pointer truncate border-0 bg-transparent p-0 text-inherit focus-visible:outline-none"
+                    aria-label={`选择流转 ${edge.title}`}
+                    onClick={() => setSelectedEdgeId(edge.id)}
+                  >
+                    {edge.label}
+                  </button>
+                ) : (
+                  <span className="min-w-0 truncate">{edge.label}</span>
+                )}
+                {edge.kind === 'edge' && edge.edgeIndex !== undefined && (
+                  <button
+                    type="button"
+                    className={cn(
+                      'pointer-events-none grid size-[18px] shrink-0 place-items-center rounded-full border border-transparent bg-transparent p-0 text-[15px] leading-none text-[#858b9c] opacity-0 transition-[opacity,background,color,border-color] hover:border-[#fecaca] hover:bg-[#fee2e2] hover:text-[#b42318] focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:outline-none',
+                      (hoveredEdgeId === edge.id || selectedEdgeId === edge.id)
+                        && 'pointer-events-auto opacity-100',
+                    )}
+                    aria-label={`删除流转 ${edge.title}`}
+                    title="删除这条流转规则"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      deleteFlowEdgeAt(edge.edgeIndex as number);
+                    }}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
             ))}
             <div
               className={FLOW_ROOT_POSITION_CLASS}
@@ -3491,7 +4599,11 @@ function SkillFlow({
               <SelectableTarget
                 className={distillFlowNodeClass('basic', true, selectedPaths, highlightedPaths, updatingPaths, dirtyPaths)}
                 target={{ path: 'basic', label: '基础信息' }}
-                onToggle={onToggle}
+                onToggle={(target) => {
+                  setSelectedNodeIndex(null);
+                  setBasicInspectorOpen(true);
+                  onToggle(target);
+                }}
               >
                 {selectedPaths.includes('basic') && <span className={SELECTION_MARK_CLASS}><CheckOutlined /></span>}
                 <span>基础信息</span>
@@ -3501,6 +4613,11 @@ function SkillFlow({
                 <div className={FLOW_META_CLASS}>
                   <FlowMetaRow label="业务域">
                     <span className={FLOW_CHIP_CLASS}>{skill.business_domain || '-'}</span>
+                  </FlowMetaRow>
+                  <FlowMetaRow label="单步上限">
+                    <span className={FLOW_CHIP_CLASS}>
+                      {skill.step_timeout_seconds ? `${skill.step_timeout_seconds} 秒` : '未单独限制'}
+                    </span>
                   </FlowMetaRow>
                   <FlowMetaRow label="必填信息">
                     <PlainChipList values={skill.required_info} />
@@ -3514,8 +4631,16 @@ function SkillFlow({
             {graphLayout.nodes.map((item) => (
               <div
                 className={FLOW_NODE_POSITION_CLASS}
+                data-flow-node-id={item.nodeId}
                 key={item.nodeId}
                 style={{ left: item.x, top: item.y, width: item.width, height: item.height }}
+                onPointerDown={(event) => startNodeDrag(event, item)}
+                onClickCapture={(event) => {
+                  if (suppressNodeClickRef.current !== item.nodeId) return;
+                  suppressNodeClickRef.current = '';
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
               >
                 <SkillFlowNodeCard
                   index={item.index}
@@ -3529,6 +4654,22 @@ function SkillFlow({
                   textDiffs={textDiffs}
                   toolDescriptions={toolDescriptions}
                   toolStatuses={toolStatuses}
+                  selected={selectedNodeId === item.nodeId}
+                  connecting={connectionDrag?.sourceNodeId === item.nodeId || armedConnectionSourceId === item.nodeId}
+                  dropTarget={connectionDrag?.targetNodeId === item.nodeId}
+                  connectHandleScale={Math.min(2.4, 1 / flowZoom)}
+                  showConnectHandle={isFullscreen}
+                  onConnectClick={armConnectionClick}
+                  onConnectStart={startConnectionDrag}
+                  onSelect={() => {
+                    if (armedConnectionSourceId) {
+                      const sourceNodeId = armedConnectionSourceId;
+                      setArmedConnectionSourceId('');
+                      connectFlowNodes(sourceNodeId, item.nodeId);
+                    }
+                    setBasicInspectorOpen(false);
+                    setSelectedNodeIndex(item.index);
+                  }}
                   onToggle={onToggle}
                 />
               </div>
@@ -3536,7 +4677,218 @@ function SkillFlow({
           </div>
         </div>
       </div>
-    </>
+      {isFullscreen && inspectorOpen && (
+        basicInspectorOpen ? (
+          <SkillFlowBasicInspector
+            skill={skill}
+            lockSkillId={lockSkillId}
+            onEditBasic={editFlowBasic}
+          />
+        ) : (
+          <SkillFlowInspector
+            node={selectedNode}
+            nodeIndex={selectedNodeIndex}
+            nodeId={selectedNodeId}
+            nodes={nodes}
+            nodeOptions={nodeOptions}
+            outgoingEdges={selectedNodeId ? edgeMap[selectedNodeId] || [] : []}
+            terminal={selectedNodeId ? terminalSet.has(selectedNodeId) : false}
+            actionOptions={actionOptions}
+            toolDescriptions={toolDescriptions}
+            toolStatuses={toolStatuses}
+            generalSkillOptions={generalSkillOptions}
+            toolOptions={toolOptions}
+            knowledgeBaseOptions={knowledgeBaseOptions}
+            onEditNode={editFlowNode}
+            onAddEdge={addFlowEdge}
+            onUpdateEdge={updateFlowEdge}
+            onDeleteEdge={deleteFlowEdge}
+          />
+        )
+      )}
+      </div>
+      </div>
+      {connectionDrag && (
+        <svg className={FLOW_CONNECTION_PREVIEW_CLASS} aria-hidden="true">
+          <path
+            d={connectionPreviewPath(connectionDrag)}
+            fill="none"
+            stroke="#04756f"
+            strokeWidth="2.25"
+            strokeLinecap="round"
+          />
+          <circle
+            cx={connectionDrag.currentX}
+            cy={connectionDrag.currentY}
+            r={connectionDrag.targetNodeId ? 5 : 3.5}
+            fill={connectionDrag.targetNodeId ? "white" : "#04756f"}
+            stroke="#04756f"
+            strokeWidth="2"
+          />
+        </svg>
+      )}
+    </div>
+  );
+}
+
+function FlowInspectorSection({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description?: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="grid min-w-0 gap-[12px] rounded-[16px] border border-[#e4e8ee] bg-white p-[14px] shadow-[0_6px_18px_rgba(24,31,45,0.035)]">
+      <div className="grid min-w-0 gap-[2px]">
+        <strong className="text-[13px] font-semibold text-[#18181a]">{title}</strong>
+        {description && <span className="text-[11px] leading-[1.5] text-[#858b9c]">{description}</span>}
+      </div>
+      <div className={SOURCE_META_LIST_CLASS}>{children}</div>
+    </section>
+  );
+}
+
+function SkillFlowBasicInspector({
+  skill,
+  lockSkillId,
+  onEditBasic,
+}: {
+  skill: SkillCard;
+  lockSkillId?: boolean;
+  onEditBasic: (
+    field: keyof SkillCard,
+    value: string | string[] | number | null,
+  ) => void;
+}) {
+  return (
+    <aside className={FLOW_INSPECTOR_CLASS} aria-label="编辑 SOP 基础信息">
+      <div className={FLOW_INSPECTOR_HEADER_CLASS}>
+        <div className="grid min-w-0 gap-[3px]">
+          <strong className="truncate text-[14px] font-semibold text-[#18181a]">基础信息 · {skill.name || '未命名 SOP'}</strong>
+          <span className="text-[11px] leading-[1.45] text-[#858b9c]">这里与源码视图的基础信息使用同一份草稿，修改会实时同步。</span>
+        </div>
+        <span className="shrink-0 rounded-full bg-[#edf8f5] px-[8px] py-[4px] text-[11px] text-[#04756f]">实时同步</span>
+      </div>
+      <div className={FLOW_INSPECTOR_BODY_CLASS}>
+        <div className="grid min-w-0 gap-[12px]">
+          <FlowInspectorSection title="身份与版本" description="定义 SOP 的稳定标识、展示名称和所属业务域。">
+            <EditableSourceTextLine label="SOP 名称" value={skill.name || ''} onChange={(value) => onEditBasic('name', value)} />
+            <EditableSourceTextLine label={fieldLabel('skill_id')} value={skill.skill_id || ''} readOnly={lockSkillId} onChange={(value) => onEditBasic('skill_id', value)} />
+            <EditableSourceTextLine label={fieldLabel('version')} value={skill.version || ''} onChange={(value) => onEditBasic('version', value)} />
+            <EditableSourceTextLine label={fieldLabel('business_domain')} value={skill.business_domain || ''} onChange={(value) => onEditBasic('business_domain', value)} />
+            <EditableSourceNumberLine
+              label={fieldLabel('step_timeout_seconds')}
+              value={skill.step_timeout_seconds}
+              min={1}
+              max={3600}
+              placeholder="不单独限制"
+              onChange={(value) => onEditBasic('step_timeout_seconds', value)}
+            />
+          </FlowInspectorSection>
+          <FlowInspectorSection title="触发与目标" description="说明何时进入流程，以及模型需要完成什么。">
+            <EditableSourceTextLine label={fieldLabel('description')} value={skill.description || ''} multiline onChange={(value) => onEditBasic('description', value)} />
+            <EditableSourceListLine label={fieldLabel('trigger_intents')} values={skill.trigger_intents} onChange={(value) => onEditBasic('trigger_intents', value)} />
+            <EditableSourceListLine label={fieldLabel('user_utterance_examples')} values={skill.user_utterance_examples} onChange={(value) => onEditBasic('user_utterance_examples', value)} />
+            <EditableSourceListLine label={fieldLabel('goal')} values={skill.goal} onChange={(value) => onEditBasic('goal', value)} />
+          </FlowInspectorSection>
+          <FlowInspectorSection title="输入与回复约束" description="列出完成流程所需的信息和最终回复规则。">
+            <EditableSourceListLine label={fieldLabel('required_info')} values={skill.required_info} onChange={(value) => onEditBasic('required_info', value)} />
+            <EditableSourceListLine label={fieldLabel('response_rules')} values={skill.response_rules} minRows={5} maxRows={14} onChange={(value) => onEditBasic('response_rules', value)} />
+          </FlowInspectorSection>
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function SkillFlowInspector({
+  node,
+  nodeIndex,
+  nodeId,
+  nodes,
+  nodeOptions,
+  outgoingEdges,
+  terminal,
+  actionOptions,
+  toolDescriptions,
+  toolStatuses,
+  generalSkillOptions,
+  toolOptions,
+  knowledgeBaseOptions,
+  onEditNode,
+  onAddEdge,
+  onUpdateEdge,
+  onDeleteEdge,
+}: {
+  node: Record<string, unknown> | null;
+  nodeIndex: number | null;
+  nodeId: string;
+  nodes: Array<Record<string, unknown>>;
+  nodeOptions: SelectOption[];
+  outgoingEdges: Array<Record<string, unknown>>;
+  terminal: boolean;
+  actionOptions: SelectOption[];
+  toolDescriptions: ToolDescriptionMap;
+  toolStatuses: ToolStatusMap;
+  generalSkillOptions: CapabilityReferenceOption[];
+  toolOptions: CapabilityReferenceOption[];
+  knowledgeBaseOptions: CapabilityReferenceOption[];
+  onEditNode: (index: number, field: string, value: string | string[] | boolean | Record<string, unknown>) => void;
+  onAddEdge: (index: number) => void;
+  onUpdateEdge: (index: number, edgeIndex: number, patch: Record<string, unknown>) => void;
+  onDeleteEdge: (index: number, edgeIndex: number) => void;
+}) {
+  if (!node || nodeIndex === null) {
+    return (
+      <aside className={FLOW_INSPECTOR_CLASS} aria-label="节点编辑器">
+        <div className={FLOW_INSPECTOR_EMPTY_CLASS}>
+          选择一个节点后，可在这里编辑对应的源码字段和流转规则。
+        </div>
+      </aside>
+    );
+  }
+  const nodeState = [
+    Boolean(node.optional) ? '可选' : '必选',
+    terminal ? '终止节点' : '流程节点',
+  ].join(' · ');
+  return (
+    <aside className={FLOW_INSPECTOR_CLASS} aria-label={`编辑节点 ${String(node.name || nodeId)}`}>
+      <div className={FLOW_INSPECTOR_HEADER_CLASS}>
+        <div className="grid min-w-0 gap-[3px]">
+          <strong className="truncate text-[14px] font-semibold text-[#18181a]">Node {nodeIndex + 1} · {String(node.name || nodeId)}</strong>
+          <span className="text-[11px] leading-[1.45] text-[#858b9c]">拖动左侧画布浏览；从节点右侧连接点拖到目标节点，可新增流转。</span>
+        </div>
+        <span className="shrink-0 rounded-full bg-[#edf8f5] px-[8px] py-[4px] text-[11px] text-[#04756f]">实时同步</span>
+      </div>
+      <div className={FLOW_INSPECTOR_BODY_CLASS}>
+        <div className="grid min-w-0 gap-[12px]">
+          <FlowInspectorSection title="节点定义" description="节点名称、类型和执行目标会直接进入 TaskFrame。">
+            <EditableSourceTextLine label="节点名称" value={String(node.name || '')} onChange={(value) => onEditNode(nodeIndex, 'name', value)} />
+            <EditableSourceTextLine label={fieldLabel('step_id')} value={nodeId} onChange={(value) => onEditNode(nodeIndex, 'step_id', value)} />
+            <EditableSourceSelectLine label={fieldLabel('type')} value={String(node.type || 'collect_info')} options={NODE_TYPE_OPTIONS} onChange={(value) => onEditNode(nodeIndex, 'type', value)} />
+            <SourceReadonlyLine label="节点状态" value={nodeState} />
+            <EditableSourceTextLine label={fieldLabel('instruction')} value={String(node.instruction || '')} multiline onChange={(value) => onEditNode(nodeIndex, 'instruction', value)} />
+          </FlowInspectorSection>
+          <FlowInspectorSection title="输入与允许动作" description="明确本节点需要收集的字段，以及模型可以自主选择的动作。">
+            <EditableSourceListLine label={fieldLabel('expected_user_info')} values={asStringList(node.expected_user_info)} onChange={(value) => onEditNode(nodeIndex, 'expected_user_info', value)} />
+            <EditableSourceActionLine values={asStringList(node.allowed_actions)} options={actionOptions} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} onChange={(value) => onEditNode(nodeIndex, 'allowed_actions', value)} />
+          </FlowInspectorSection>
+          <FlowInspectorSection title="节点专用能力" description="SOP-specific 能力只有在这里明确引用后，才会进入当前节点的 Harness 能力清单。">
+            <EditableCapabilityReferencesLine label="SOP 技能" values={asStringList(node.general_skill_ids)} requiredValues={asStringList(node.required_general_skill_ids)} options={generalSkillOptions} emptyText="未指定技能" onChange={(value) => onEditNode(nodeIndex, 'general_skill_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_general_skill_ids', value)} />
+            <EditableCapabilityReferencesLine label="SOP 工具" values={asStringList(node.tool_ids)} requiredValues={asStringList(node.required_tool_ids)} options={toolOptions} emptyText="未指定工具" onChange={(value) => onEditNode(nodeIndex, 'tool_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_tool_ids', value)} />
+            <EditableCapabilityReferencesLine label="SOP 知识库" values={asStringList(node.knowledge_base_ids)} requiredValues={asStringList(node.required_knowledge_base_ids)} options={knowledgeBaseOptions} emptyText="未指定知识库" onChange={(value) => onEditNode(nodeIndex, 'knowledge_base_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_knowledge_base_ids', value)} />
+          </FlowInspectorSection>
+          <FlowInspectorSection title="流转与失败处理" description="按优先级判断规则；未命中时使用重试策略或终止流程。">
+            <EditableFlowRulesLine sourceNodeId={nodeId} edges={outgoingEdges} nodes={nodes} nodeOptions={nodeOptions} terminal={terminal} onAdd={() => onAddEdge(nodeIndex)} onUpdate={(edgeIndex, patch) => onUpdateEdge(nodeIndex, edgeIndex, patch)} onDelete={(edgeIndex) => onDeleteEdge(nodeIndex, edgeIndex)} />
+            <SourceJsonLine label="知识范围" value={node.knowledge_scope} />
+            <EditableRetryPolicyLine value={node.retry_policy} onChange={(value) => onEditNode(nodeIndex, 'retry_policy', value)} />
+          </FlowInspectorSection>
+        </div>
+      </div>
+    </aside>
   );
 }
 
@@ -3552,6 +4904,14 @@ function SkillFlowNodeCard({
   textDiffs,
   toolDescriptions,
   toolStatuses,
+  selected,
+  connecting,
+  dropTarget,
+  connectHandleScale,
+  showConnectHandle,
+  onConnectClick,
+  onConnectStart,
+  onSelect,
   onToggle,
 }: {
   index: number;
@@ -3565,6 +4925,14 @@ function SkillFlowNodeCard({
   textDiffs: TextDiffAnimation[];
   toolDescriptions: ToolDescriptionMap;
   toolStatuses: ToolStatusMap;
+  selected: boolean;
+  connecting: boolean;
+  dropTarget: boolean;
+  connectHandleScale: number;
+  showConnectHandle: boolean;
+  onConnectClick: (event: MouseEvent<HTMLButtonElement>, sourceNodeId: string) => void;
+  onConnectStart: (event: ReactPointerEvent<HTMLButtonElement>, sourceNodeId: string) => void;
+  onSelect: () => void;
   onToggle: (target: TargetSelection) => void;
 }) {
   const nodeId = String(step.node_id || step.step_id || `node_${index + 1}`);
@@ -3575,9 +4943,17 @@ function SkillFlowNodeCard({
   return (
     <div className={FLOW_NODE_SHELL_CLASS}>
       <SelectableTarget
-        className={distillFlowNodeClass(path, false, selectedPaths, highlightedPaths, updatingPaths, dirtyPaths)}
+        className={cn(
+          distillFlowNodeClass(path, false, selectedPaths, highlightedPaths, updatingPaths, dirtyPaths),
+          'cursor-grab! active:cursor-grabbing!',
+          selected && 'border-[#04756f]! shadow-[0_0_0_3px_rgba(4,117,111,0.10),0_12px_30px_rgba(4,117,111,0.08)]',
+          dropTarget && 'border-[#04756f]! shadow-[0_0_0_4px_rgba(4,117,111,0.12),0_12px_30px_rgba(4,117,111,0.10)]',
+        )}
         target={{ path, label: `节点 ${index + 1}：${step.name || nodeId}` }}
-        onToggle={onToggle}
+        onToggle={(target) => {
+          onSelect();
+          onToggle(target);
+        }}
       >
         {selectedPaths.includes(path) && <span className={SELECTION_MARK_CLASS}><CheckOutlined /></span>}
         <span>节点 {index + 1}</span>
@@ -3595,18 +4971,32 @@ function SkillFlowNodeCard({
           {expectedInfo.length > 0 && (
             <div className={FLOW_COMPACT_ROW_CLASS}>
               <span>字段</span>
-              <PlainChipList values={expectedInfo.slice(0, 4)} />
+              <PlainChipList values={expectedInfo} />
             </div>
           )}
           {actionList.length > 0 && (
             <div className={FLOW_COMPACT_ROW_CLASS}>
               <span>动作</span>
-              <ActionList actions={actionList.slice(0, 4)} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} />
+              <FlowActionList actions={actionList} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} />
             </div>
           )}
           {outgoingEdges.length > 0 && <span className={FLOW_ROUTE_COUNT_CLASS}>{outgoingRouteCountLabel(outgoingEdges)}</span>}
         </div>
       </SelectableTarget>
+      {showConnectHandle && (
+        <button
+          type="button"
+          data-flow-connect-handle
+          className={cn(FLOW_NODE_CONNECT_HANDLE_CLASS, connecting && FLOW_NODE_CONNECT_HANDLE_ACTIVE_CLASS)}
+          style={{ transform: `translateX(-50%) scale(${connectHandleScale})` }}
+          aria-label={`从「${String(step.name || nodeId)}」拖线连接节点`}
+          title="拖到另一个节点以新增流转规则"
+          onPointerDown={(event) => onConnectStart(event, nodeId)}
+          onClick={(event) => onConnectClick(event, nodeId)}
+        >
+          +
+        </button>
+      )}
     </div>
   );
 }
@@ -3634,24 +5024,87 @@ function PlainChipList({ values }: { values: unknown }) {
   );
 }
 
+function FlowActionList({
+  actions,
+  toolDescriptions,
+  toolStatuses,
+}: {
+  actions: string[];
+  toolDescriptions: ToolDescriptionMap;
+  toolStatuses: ToolStatusMap;
+}) {
+  return (
+    <div className="flex min-w-0 flex-wrap gap-[6px]">
+      {actions.map((action, index) => (
+        <ActionChip action={action} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} key={`${action}_${index}`} />
+      ))}
+    </div>
+  );
+}
+
 function skillGraphSteps(skill: SkillCard): Array<Record<string, unknown>> {
   if (Array.isArray(skill.nodes) && skill.nodes.length > 0) {
-    return skill.nodes.map((node, index) => ({
-      step_id: node.node_id || `node_${index + 1}`,
-      node_id: node.node_id || `node_${index + 1}`,
-      type: node.type || 'collect_info',
-      name: node.name || node.node_id || `节点 ${index + 1}`,
-      instruction: node.instruction || '',
-      optional: Boolean(node.optional),
-      condition: node.condition || '',
-      expected_user_info: asStringList(node.expected_user_info),
-      allowed_actions: asStringList(node.allowed_actions),
-      knowledge_scope: isRecord(node.knowledge_scope) ? node.knowledge_scope : {},
-      retry_policy: isRecord(node.retry_policy) ? node.retry_policy : {},
-      metadata: isRecord(node.metadata) ? node.metadata : {},
-    }));
+    return skill.nodes.map((node, index) => {
+      const capabilityRefs = nodeCapabilityRefs(node);
+      return {
+        step_id: node.node_id || `node_${index + 1}`,
+        node_id: node.node_id || `node_${index + 1}`,
+        type: node.type || 'collect_info',
+        name: node.name || node.node_id || `节点 ${index + 1}`,
+        instruction: node.instruction || '',
+        optional: Boolean(node.optional),
+        condition: node.condition || '',
+        expected_user_info: asStringList(node.expected_user_info),
+        allowed_actions: asStringList(node.allowed_actions),
+        general_skill_ids: capabilityRefs.general_skill_ids,
+        tool_ids: capabilityRefs.tool_ids,
+        knowledge_base_ids: capabilityRefs.knowledge_base_ids,
+        required_general_skill_ids: capabilityRefs.required_general_skill_ids,
+        required_tool_ids: capabilityRefs.required_tool_ids,
+        required_knowledge_base_ids: capabilityRefs.required_knowledge_base_ids,
+        knowledge_scope: isRecord(node.knowledge_scope) ? node.knowledge_scope : {},
+        retry_policy: isRecord(node.retry_policy) ? node.retry_policy : {},
+        metadata: isRecord(node.metadata) ? node.metadata : {},
+      };
+    });
   }
   return [];
+}
+
+function nodeCapabilityRefs(node: Record<string, unknown>) {
+  const refs = isRecord(node.capability_refs) ? node.capability_refs : {};
+  const generalSkillIds = asStringList(refs.general_skill_ids ?? node.general_skill_ids);
+  const toolIds = asStringList(refs.tool_ids ?? node.tool_ids);
+  const knowledgeBaseIds = asStringList(refs.knowledge_base_ids ?? node.knowledge_base_ids);
+  return {
+    general_skill_ids: generalSkillIds,
+    tool_ids: toolIds,
+    knowledge_base_ids: knowledgeBaseIds,
+    required_general_skill_ids: asStringList(
+      refs.required_general_skill_ids ?? node.required_general_skill_ids,
+    ).filter((value) => generalSkillIds.includes(value)),
+    required_tool_ids: asStringList(
+      refs.required_tool_ids ?? node.required_tool_ids,
+    ).filter((value) => toolIds.includes(value)),
+    required_knowledge_base_ids: asStringList(
+      refs.required_knowledge_base_ids ?? node.required_knowledge_base_ids,
+    ).filter((value) => knowledgeBaseIds.includes(value)),
+  };
+}
+
+function updateCapabilityRefs(
+  refs: ReturnType<typeof nodeCapabilityRefs>,
+  field: string,
+  values: string[],
+): ReturnType<typeof nodeCapabilityRefs> {
+  const next = { ...refs, [field]: Array.from(new Set(values)) };
+  const requiredField = REQUIRED_CAPABILITY_FIELD_BY_ALLOWED[field];
+  if (requiredField) {
+    next[requiredField as keyof typeof next] = asStringList(
+      next[requiredField as keyof typeof next],
+    ).filter((value) => values.includes(value));
+  }
+  return next;
 }
 
 function skillGraphEdgeMap(skill: SkillCard): Record<string, Array<Record<string, unknown>>> {
@@ -3733,6 +5186,7 @@ type SkillFlowCanvasNode = {
 type SkillFlowCanvasEdge = {
   id: string;
   kind: 'root' | 'edge';
+  edgeIndex?: number;
   labelTone?: 'root' | 'branch' | 'parallel' | 'return';
   label: string;
   title: string;
@@ -3741,16 +5195,41 @@ type SkillFlowCanvasEdge = {
   labelY: number;
 };
 
+function estimatedWrappedLines(value: unknown, charactersPerLine: number): number {
+  const text = String(value || '').trim();
+  if (!text) return 1;
+  return text.split('\n').reduce((total, line) => (
+    total + Math.max(1, Math.ceil(Array.from(line).length / charactersPerLine))
+  ), 0);
+}
+
+function estimateSkillFlowNodeHeight(nodes: Array<Record<string, unknown>>): number {
+  return Math.max(324, ...nodes.map((node) => {
+    const instructionHeight = estimatedWrappedLines(node.instruction || '暂无说明', 24) * 21;
+    const fieldRows = Math.ceil(asStringList(node.expected_user_info).length / 3) * 28;
+    const actionRows = Math.ceil(asStringList(node.allowed_actions).length / 2) * 28;
+    return 182 + instructionHeight + fieldRows + actionRows + 48;
+  }));
+}
+
+function estimateSkillFlowRootHeight(skill: SkillCard): number {
+  const descriptionHeight = estimatedWrappedLines(skill.description || '暂无描述', 38) * 21;
+  const infoRows = Math.ceil(asStringList(skill.required_info).length / 4) * 28;
+  const intentRows = Math.ceil(asStringList(skill.trigger_intents).length / 4) * 28;
+  return Math.max(270, 154 + descriptionHeight + infoRows + intentRows + 72);
+}
+
 function buildSkillFlowCanvasLayout(
   skill: SkillCard,
   nodes: Array<Record<string, unknown>>,
   nodeNameMap: Record<string, string>,
+  positionOverrides: Record<string, SkillFlowPosition> = {},
 ) {
   const layerLayout = buildSkillFlowLayout(skill, nodes);
   const cardWidth = 360;
-  const cardHeight = 324;
+  const cardHeight = estimateSkillFlowNodeHeight(nodes);
   const rootWidth = 500;
-  const rootHeight = 270;
+  const rootHeight = estimateSkillFlowRootHeight(skill);
   const columnGap = 188;
   const rowGap = 236;
   const rootGap = 126;
@@ -3760,9 +5239,9 @@ function buildSkillFlowCanvasLayout(
     layer.length * cardWidth + Math.max(0, layer.length - 1) * columnGap
   ));
   const maxContentWidth = Math.max(rootWidth, ...layerWidths, 0);
-  const width = Math.max(1180, paddingX * 2 + maxContentWidth);
+  const baseWidth = Math.max(1180, paddingX * 2 + maxContentWidth);
   const root = {
-    x: (width - rootWidth) / 2,
+    x: (baseWidth - rootWidth) / 2,
     y: paddingY,
     width: rootWidth,
     height: rootHeight,
@@ -3772,13 +5251,17 @@ function buildSkillFlowCanvasLayout(
 
   layerLayout.layers.forEach((layer, layerIndex) => {
     const layerWidth = layer.length * cardWidth + Math.max(0, layer.length - 1) * columnGap;
-    const layerStartX = Math.max(paddingX, (width - layerWidth) / 2);
+    const layerStartX = Math.max(paddingX, (baseWidth - layerWidth) / 2);
     layer.forEach((item, itemIndex) => {
       const positioned = {
         ...item,
         rank: layerIndex,
-        x: layerStartX + itemIndex * (cardWidth + columnGap),
-        y: paddingY + rootHeight + rootGap + layerIndex * (cardHeight + rowGap),
+        x: positionOverrides[item.nodeId]?.x
+          ?? skillNodeFlowPosition(item.step)?.x
+          ?? layerStartX + itemIndex * (cardWidth + columnGap),
+        y: positionOverrides[item.nodeId]?.y
+          ?? skillNodeFlowPosition(item.step)?.y
+          ?? paddingY + rootHeight + rootGap + layerIndex * (cardHeight + rowGap),
         width: cardWidth,
         height: cardHeight,
       };
@@ -3786,6 +5269,11 @@ function buildSkillFlowCanvasLayout(
       positionMap.set(item.nodeId, positioned);
     });
   });
+
+  const width = Math.max(
+    baseWidth,
+    ...positionedNodes.map((node) => node.x + node.width + paddingX),
+  );
 
   const rawEdges = Array.isArray(skill.edges) ? skill.edges : [];
   const edgeSiblingCounts = rawEdges.reduce<Record<string, number>>((acc, edge) => {
@@ -3809,7 +5297,11 @@ function buildSkillFlowCanvasLayout(
   const edgeSiblingIndexes: Record<string, number> = {};
   const incomingIndexes: Record<string, number> = {};
   const layoutEdges: SkillFlowCanvasEdge[] = [];
-  const height = paddingY * 2 + rootHeight + rootGap + layerLayout.layers.length * cardHeight + Math.max(0, layerLayout.layers.length - 1) * rowGap;
+  const baseHeight = paddingY * 2 + rootHeight + rootGap + layerLayout.layers.length * cardHeight + Math.max(0, layerLayout.layers.length - 1) * rowGap;
+  const height = Math.max(
+    baseHeight,
+    ...positionedNodes.map((node) => node.y + node.height + paddingY),
+  );
   const startNode = positionMap.get(String(skill.start_node_id || positionedNodes[0]?.nodeId || ''));
   if (startNode) {
     const sourceX = root.x + root.width / 2;
@@ -3872,6 +5364,7 @@ function buildSkillFlowCanvasLayout(
     layoutEdges.push({
       id: `${sourceId}_${targetId}_${index}`,
       kind: 'edge',
+      edgeIndex: index,
       label: compactEdgeLabel(label),
       title,
       path,
@@ -3997,6 +5490,33 @@ function forwardFlowPath(sourceX: number, sourceY: number, targetX: number, targ
     `C ${sourceX} ${sourceY + verticalEase}, ${sourceX} ${safeLaneY - verticalEase}, ${sourceX} ${safeLaneY}`,
     `C ${sourceX + Math.sign(targetX - sourceX) * bend} ${safeLaneY}, ${targetX - Math.sign(targetX - sourceX) * bend} ${safeLaneY}, ${targetX} ${safeLaneY}`,
     `C ${targetX} ${safeLaneY + verticalEase}, ${targetX} ${targetY - verticalEase}, ${targetX} ${targetY}`,
+  ].join(' ');
+}
+
+function connectionPreviewPath(connection: {
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+}): string {
+  const { startX, startY, currentX, currentY } = connection;
+  const horizontalDistance = Math.abs(currentX - startX);
+  const verticalDistance = currentY - startY;
+  if (verticalDistance >= 36) {
+    const tension = Math.max(54, Math.min(180, verticalDistance * 0.42 + horizontalDistance * 0.08));
+    return `M ${startX} ${startY} C ${startX} ${startY + tension}, ${currentX} ${currentY - tension}, ${currentX} ${currentY}`;
+  }
+  const direction = currentX >= startX ? 1 : -1;
+  const sideX = direction > 0
+    ? Math.max(startX, currentX) + Math.max(92, Math.min(150, horizontalDistance * 0.24 + 88))
+    : Math.min(startX, currentX) - Math.max(92, Math.min(150, horizontalDistance * 0.24 + 88));
+  const exitY = startY + 54;
+  const entryY = currentY - 54;
+  return [
+    `M ${startX} ${startY}`,
+    `C ${startX} ${startY + 30}, ${sideX} ${exitY - 20}, ${sideX} ${exitY}`,
+    `C ${sideX} ${(exitY + entryY) / 2}, ${sideX} ${(exitY + entryY) / 2}, ${sideX} ${entryY}`,
+    `C ${sideX} ${entryY + 20}, ${currentX} ${currentY - 30}, ${currentX} ${currentY}`,
   ].join(' ');
 }
 
@@ -4501,13 +6021,63 @@ function EditableSourceTextLine({
   );
 }
 
+function EditableSourceNumberLine({
+  label,
+  value,
+  min,
+  max,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  value?: number | null;
+  min: number;
+  max: number;
+  placeholder?: string;
+  onChange: (value: number | null) => void;
+}) {
+  return (
+    <div className={SOURCE_LINE_CLASS}>
+      <span className={SOURCE_KEY_CLASS}>{label}</span>
+      <span className={SOURCE_VALUE_CLASS}>
+        <EditableSourceField>
+          <SourceInput
+            className={SOURCE_EDIT_INPUT_CLASS}
+            type="number"
+            min={min}
+            max={max}
+            step={1}
+            value={value == null ? '' : String(value)}
+            placeholder={placeholder}
+            style={sourceInputStyle(value == null ? '' : String(value))}
+            onChange={(event) => {
+              if (!event.target.value.trim()) {
+                onChange(null);
+                return;
+              }
+              const next = Number(event.target.value);
+              if (Number.isFinite(next)) {
+                onChange(Math.max(min, Math.min(max, Math.round(next))));
+              }
+            }}
+          />
+        </EditableSourceField>
+      </span>
+    </div>
+  );
+}
+
 function EditableSourceListLine({
   label,
   values,
+  minRows = 1,
+  maxRows,
   onChange,
 }: {
   label: string;
   values: string[];
+  minRows?: number;
+  maxRows?: number;
   onChange: (value: string) => void;
 }) {
   return (
@@ -4519,7 +6089,8 @@ function EditableSourceListLine({
             className={SOURCE_EDIT_INPUT_CLASS}
             value={values.join('\n')}
             style={sourceInputStyle(values.join('\n'), true)}
-            minRows={1}
+            minRows={minRows}
+            maxRows={maxRows}
             onChange={(event) => onChange(event.target.value)}
           />
         </EditableSourceField>
@@ -4752,6 +6323,202 @@ function EditableSourceActionLine({
   );
 }
 
+export function EditableCapabilityReferencesLine({
+  label,
+  values,
+  requiredValues,
+  options,
+  emptyText,
+  onChange,
+  onRequiredChange,
+}: {
+  label: string;
+  values: string[];
+  requiredValues: string[];
+  options: CapabilityReferenceOption[];
+  emptyText: string;
+  onChange: (value: string[]) => void;
+  onRequiredChange: (value: string[]) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const mergedOptions = mergeCapabilityReferenceOptions(options, values);
+  const selected = new Set(values);
+  const required = new Set(requiredValues);
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredOptions = mergedOptions
+    .filter((option) => {
+      if (!normalizedQuery) return true;
+      return [option.label, option.value, option.description]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+        .includes(normalizedQuery);
+    })
+    .sort((left, right) => Number(selected.has(right.value)) - Number(selected.has(left.value)));
+
+  function toggle(value: string, checked: boolean) {
+    if (checked) {
+      onChange(Array.from(new Set([...values, value])));
+      return;
+    }
+    onChange(values.filter((item) => item !== value));
+  }
+
+  function setRequired(value: string, checked: boolean) {
+    if (checked) {
+      onRequiredChange(Array.from(new Set([...requiredValues, value])));
+      return;
+    }
+    onRequiredChange(requiredValues.filter((item) => item !== value));
+  }
+
+  return (
+    <div className={SOURCE_LINE_CLASS}>
+      <span className={SOURCE_KEY_CLASS}>{label}</span>
+      <span className={SOURCE_VALUE_CLASS}>
+        <EditableSourceField>
+          <Popover>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className="flex min-h-[34px] w-full items-center justify-between gap-[10px] rounded-[8px] border border-[#dfe3eb] bg-white px-[10px] py-[6px] text-left outline-none transition-colors hover:border-[#c7cedc] focus-visible:border-[#1a71ff] focus-visible:ring-2 focus-visible:ring-[#1a71ff]/15"
+              >
+                <span className="flex min-w-0 flex-1 flex-wrap gap-[5px]">
+                  {values.length === 0 ? (
+                    <span className="text-[12px] text-[#a0a7b8]">{emptyText}</span>
+                  ) : (
+                    values.map((value) => {
+                      const option = mergedOptions.find((item) => item.value === value);
+                      return (
+                        <span
+                          key={value}
+                          className={cn(
+                            'inline-flex max-w-[200px] items-center gap-[5px] rounded-full px-[8px] py-[3px] text-[11px]',
+                            required.has(value)
+                              ? 'bg-[#fff1dc] text-[#9a5a00]'
+                              : 'bg-[#eef3fb] text-[#464c5e]',
+                          )}
+                          title={option?.label || value}
+                        >
+                          <span className="truncate">{option?.label || value}</span>
+                          <span className="shrink-0 text-[9px] opacity-75">
+                            {required.has(value) ? '强制' : '可选'}
+                          </span>
+                        </span>
+                      );
+                    })
+                  )}
+                </span>
+                <span className="shrink-0 text-[11px] text-[#1a71ff]">
+                  {values.length > 0 ? `已选择 ${values.length} 个` : '选择'}
+                </span>
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="z-[130] w-[min(420px,calc(100vw-32px))] p-0">
+              <div className="border-b border-[#eceef1] p-[10px]">
+                <Input
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder={`搜索${label}`}
+                  className="h-[32px]"
+                />
+              </div>
+              <div className="max-h-[300px] overflow-y-auto p-[6px]">
+                {filteredOptions.length === 0 ? (
+                  <div className="px-[10px] py-[24px] text-center text-[12px] text-[#858b9c]">暂无可选能力</div>
+                ) : (
+                  filteredOptions.map((option) => {
+                    const checked = selected.has(option.value);
+                    const disabled = Boolean(option.unavailableReason) && !checked;
+                    return (
+                      <div
+                        key={option.value}
+                        className={cn(
+                          'flex items-start gap-[10px] rounded-[8px] px-[9px] py-[8px]',
+                          disabled ? 'cursor-not-allowed opacity-55' : 'cursor-pointer hover:bg-[#f6f8fb]',
+                        )}
+                      >
+                        <Checkbox
+                          checked={checked}
+                          disabled={disabled}
+                          className="mt-[2px]"
+                          onCheckedChange={(next) => toggle(option.value, next === true)}
+                          aria-label={`${checked ? '取消选择' : '选择'}${option.label}`}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex min-w-0 flex-wrap items-center gap-[6px]">
+                            <strong className="truncate text-[12px] font-medium text-[#18181a]">{option.label}</strong>
+                            <CapabilityScopeBadge value={option.capabilityScope} />
+                            {option.unavailableReason && (
+                              <span className="text-[10px] text-[#d20b0b]">{option.unavailableReason}</span>
+                            )}
+                          </span>
+                          <span className="mt-[2px] block truncate text-[11px] text-[#858b9c]">
+                            {option.description || option.value}
+                          </span>
+                        </span>
+                        {checked && (
+                          <span className="inline-flex shrink-0 rounded-[7px] bg-[#f0f2f6] p-[2px] text-[10px]">
+                            <button
+                              type="button"
+                              className={cn(
+                                'rounded-[5px] px-[7px] py-[3px] transition-colors',
+                                !required.has(option.value)
+                                  ? 'bg-white text-[#1a71ff] shadow-sm'
+                                  : 'text-[#7c8495] hover:text-[#464c5e]',
+                              )}
+                              onClick={() => setRequired(option.value, false)}
+                            >
+                              可选执行
+                            </button>
+                            <button
+                              type="button"
+                              className={cn(
+                                'rounded-[5px] px-[7px] py-[3px] transition-colors',
+                                required.has(option.value)
+                                  ? 'bg-[#fff7e8] text-[#a45f00] shadow-sm'
+                                  : 'text-[#7c8495] hover:text-[#464c5e]',
+                              )}
+                              onClick={() => setRequired(option.value, true)}
+                            >
+                              强制执行
+                            </button>
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+              <div className="border-t border-[#eceef1] px-[12px] py-[8px] text-[11px] leading-[1.45] text-[#858b9c]">
+                通用能力始终可由模型自主选择；仅限 SOP 的能力需在当前节点选择。标记为强制执行后，成功调用才允许推进节点。
+              </div>
+            </PopoverContent>
+          </Popover>
+        </EditableSourceField>
+      </span>
+    </div>
+  );
+}
+
+function mergeCapabilityReferenceOptions(
+  options: CapabilityReferenceOption[],
+  values: string[],
+): CapabilityReferenceOption[] {
+  const existing = new Set(options.map((option) => option.value));
+  return [
+    ...options,
+    ...values
+      .filter((value) => !existing.has(value))
+      .map((value) => ({
+        value,
+        label: value,
+        description: '资源当前不可用，可取消引用',
+        unavailableReason: '资源不可用',
+      })),
+  ];
+}
+
 function EditableActionList({
   actions,
   options,
@@ -4832,10 +6599,10 @@ function EditableActionList({
                 className={SOURCE_ACTION_EDIT_BUTTON_CLASS}
                 onClick={() => setEditingIndex(index)}
               >
-                <ActionChip action={action} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} />
+                <ActionChip action={action} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} editable />
               </button>
               <button type="button" className={SOURCE_ACTION_REMOVE_CLASS} onClick={() => removeAction(index)} aria-label={`移除 ${actionLabel(action)}`}>
-                ×
+                <CloseOutlined />
               </button>
             </span>
           )
@@ -4845,7 +6612,16 @@ function EditableActionList({
             {actionSelect(editingIndex)}
           </span>
         )}
-        {editingIndex === null && (
+        {actions.length === 0 && editingIndex === null && (
+          <div className={SOURCE_ACTION_EMPTY_CLASS}>
+            <span>当前节点还没有允许动作</span>
+            <button type="button" className={SOURCE_ACTION_ADD_CLASS} onClick={() => setEditingIndex(0)}>
+              <PlusOutlined />
+              添加动作
+            </button>
+          </div>
+        )}
+        {actions.length > 0 && editingIndex === null && (
           <button type="button" className={SOURCE_ACTION_ADD_CLASS} onClick={() => setEditingIndex(actions.length)}>
             <PlusOutlined />
             新增动作
@@ -5080,11 +6856,13 @@ function ActionChip({
   toolDescriptions,
   toolStatuses,
   className = '',
+  editable = false,
 }: {
   action: string;
   toolDescriptions: ToolDescriptionMap;
   toolStatuses: ToolStatusMap;
   className?: string;
+  editable?: boolean;
 }) {
   const toolName = toolNameFromAction(action);
   const description = toolName ? toolDescriptions[toolName] || '当前工具配置中暂无描述' : '';
@@ -5101,7 +6879,7 @@ function ActionChip({
 
   return (
     <span
-      className={actionChipClass({ toolName: toolName || undefined, status, variant })}
+      className={cn(actionChipClass({ toolName: toolName || undefined, status, variant }), editable && 'pr-[26px]')}
       title={description || undefined}
     >
       {actionLabel(action)}
@@ -5265,6 +7043,10 @@ function parseCompleteStreamSkill(streamText: string): SkillCard | null {
       version: stringValue(draft.version, '1.0.0'),
       business_domain: stringValue(draft.business_domain, ''),
       description: stringValue(draft.description, ''),
+      step_timeout_seconds:
+        typeof draft.step_timeout_seconds === 'number'
+          ? draft.step_timeout_seconds
+          : null,
       trigger_intents: asStringList(draft.trigger_intents),
       user_utterance_examples: asStringList(draft.user_utterance_examples),
       goal: asStringList(draft.goal),
@@ -5331,7 +7113,22 @@ function parseNodeFragment(fragment: string, index: number): Record<string, unkn
   const condition = extractJsonStringField(fragment, 'condition') || '';
   const expectedUserInfo = extractJsonStringArrayField(fragment, 'expected_user_info') || [];
   const allowedActions = extractJsonStringArrayField(fragment, 'allowed_actions') || [];
-  if (!nodeId && !name && !instruction && expectedUserInfo.length === 0 && allowedActions.length === 0) {
+  const generalSkillIds = extractJsonStringArrayField(fragment, 'general_skill_ids') || [];
+  const toolIds = extractJsonStringArrayField(fragment, 'tool_ids') || [];
+  const knowledgeBaseIds = extractJsonStringArrayField(fragment, 'knowledge_base_ids') || [];
+  const requiredGeneralSkillIds = extractJsonStringArrayField(fragment, 'required_general_skill_ids') || [];
+  const requiredToolIds = extractJsonStringArrayField(fragment, 'required_tool_ids') || [];
+  const requiredKnowledgeBaseIds = extractJsonStringArrayField(fragment, 'required_knowledge_base_ids') || [];
+  if (
+    !nodeId
+    && !name
+    && !instruction
+    && expectedUserInfo.length === 0
+    && allowedActions.length === 0
+    && generalSkillIds.length === 0
+    && toolIds.length === 0
+    && knowledgeBaseIds.length === 0
+  ) {
     return null;
   }
   return {
@@ -5343,6 +7140,14 @@ function parseNodeFragment(fragment: string, index: number): Record<string, unkn
     condition,
     expected_user_info: expectedUserInfo,
     allowed_actions: allowedActions,
+    capability_refs: {
+      general_skill_ids: generalSkillIds,
+      tool_ids: toolIds,
+      knowledge_base_ids: knowledgeBaseIds,
+      required_general_skill_ids: requiredGeneralSkillIds,
+      required_tool_ids: requiredToolIds,
+      required_knowledge_base_ids: requiredKnowledgeBaseIds,
+    },
     knowledge_scope: {},
     retry_policy: {},
     metadata: {},
@@ -5351,6 +7156,7 @@ function parseNodeFragment(fragment: string, index: number): Record<string, unkn
 
 function normalizeNodePreview(node: Record<string, unknown>, index = 0): Record<string, unknown> {
   const nodeId = stringValue(node.node_id, `node_${index + 1}`);
+  const capabilityRefs = nodeCapabilityRefs(node);
   return {
     node_id: nodeId,
     type: stringValue(node.type, 'collect_info'),
@@ -5360,6 +7166,7 @@ function normalizeNodePreview(node: Record<string, unknown>, index = 0): Record<
     condition: stringValue(node.condition, ''),
     expected_user_info: asStringList(node.expected_user_info),
     allowed_actions: asStringList(node.allowed_actions),
+    capability_refs: capabilityRefs,
     knowledge_scope: isRecord(node.knowledge_scope) ? node.knowledge_scope : {},
     retry_policy: isRecord(node.retry_policy) ? node.retry_policy : {},
     metadata: isRecord(node.metadata) ? node.metadata : {},
@@ -5667,7 +7474,7 @@ function normalizeToolSuggestions(value: unknown): ToolSuggestionItem[] {
       display_name: typeof item.display_name === 'string' ? item.display_name : undefined,
       description: typeof item.description === 'string' ? item.description : undefined,
       bucket: typeof item.bucket === 'string' && item.bucket.trim() ? item.bucket.trim() : '技能自发现工具',
-      tool_type: item.tool_type === 'mcp' ? 'mcp' : 'http',
+      tool_type: item.tool_type === 'mcp' ? 'mcp' : item.tool_type === 'a2a' ? 'a2a' : 'http',
       method: typeof item.method === 'string' ? item.method : 'POST',
       url: typeof item.url === 'string' ? item.url : '',
       mcp_config: isRecord(item.mcp_config) ? item.mcp_config : {},
@@ -5877,6 +7684,22 @@ function cloneSkill(skill: SkillCard): SkillCard {
   return JSON.parse(JSON.stringify(skill)) as SkillCard;
 }
 
+function canonicalizeSkillCapabilityRefs(skill: SkillCard): SkillCard {
+  const next = cloneSkill(skill);
+  next.nodes = (Array.isArray(next.nodes) ? next.nodes : []).map((node) => {
+    const normalized = { ...node, capability_refs: nodeCapabilityRefs(node) };
+    const legacyFields = normalized as Record<string, unknown>;
+    delete legacyFields.general_skill_ids;
+    delete legacyFields.tool_ids;
+    delete legacyFields.knowledge_base_ids;
+    delete legacyFields.required_general_skill_ids;
+    delete legacyFields.required_tool_ids;
+    delete legacyFields.required_knowledge_base_ids;
+    return normalized;
+  });
+  return next;
+}
+
 function uniqueDraftSkillId(skillId: string): string {
   const normalized = (skillId || 'skill')
     .trim()
@@ -5995,6 +7818,14 @@ function blankSkillForAnimation(skill: SkillCard): SkillCard {
     condition: '',
     expected_user_info: [],
     allowed_actions: [],
+    capability_refs: {
+      general_skill_ids: [],
+      tool_ids: [],
+      knowledge_base_ids: [],
+      required_general_skill_ids: [],
+      required_tool_ids: [],
+      required_knowledge_base_ids: [],
+    },
     knowledge_scope: {},
     retry_policy: {},
     metadata: {},
@@ -6018,6 +7849,7 @@ function sectionSignature(skill: SkillCard, path: string): string {
       version: skill.version,
       business_domain: skill.business_domain || '',
       description: skill.description,
+      step_timeout_seconds: skill.step_timeout_seconds ?? null,
       trigger_intents: skill.trigger_intents || [],
       user_utterance_examples: skill.user_utterance_examples || [],
       goal: skill.goal || [],
@@ -6060,7 +7892,18 @@ function collectTextDiffs(previousDraft: SkillCard, nextDraft: SkillCard, change
     }
     const stepIndex = stepIndexFromPath(path);
     if (stepIndex === null) return;
-    ['step_id', 'type', 'condition', 'name', 'instruction', 'expected_user_info', 'allowed_actions'].forEach((field) => {
+    [
+      'step_id',
+      'type',
+      'condition',
+      'name',
+      'instruction',
+      'expected_user_info',
+      'allowed_actions',
+      'general_skill_ids',
+      'tool_ids',
+      'knowledge_base_ids',
+    ].forEach((field) => {
       const diff = makeTextDiff(
         path,
         field,
@@ -6134,6 +7977,9 @@ function isListField(field: string): boolean {
     'response_rules',
     'expected_user_info',
     'allowed_actions',
+    'general_skill_ids',
+    'tool_ids',
+    'knowledge_base_ids',
   ].includes(field);
 }
 
@@ -6205,9 +8051,10 @@ function toolPayloadFromSuggestion(suggestion: ToolSuggestionItem, skillId?: str
     url: suggestion.url || `/api/mock/${suggestion.name.replace(/\./g, '/')}`,
     headers: {},
     auth: {},
-    mcp_config: suggestion.tool_type === 'mcp' ? suggestion.mcp_config || {} : {},
+    mcp_config: suggestion.tool_type === 'mcp' || suggestion.tool_type === 'a2a' ? suggestion.mcp_config || {} : {},
     input_schema: suggestion.input_schema || {},
     output_schema: outputSchema,
+    execution_policy: { timeout_seconds: 8 },
     allowed_skills: skillId ? [skillId] : [],
     enabled: true,
   };
@@ -6229,9 +8076,10 @@ function toolReadFromSuggestion(suggestion: ToolSuggestionItem, skillId?: string
     url: suggestion.url || `/api/mock/${suggestion.name.replace(/\./g, '/')}`,
     headers: {},
     auth: {},
-    mcp_config: suggestion.tool_type === 'mcp' ? suggestion.mcp_config || {} : {},
+    mcp_config: suggestion.tool_type === 'mcp' || suggestion.tool_type === 'a2a' ? suggestion.mcp_config || {} : {},
     input_schema: suggestion.input_schema || {},
     output_schema: outputSchema,
+    execution_policy: { timeout_seconds: 8 },
     allowed_skills: skillId ? [skillId] : [],
     enabled: true,
     created_at: new Date().toISOString(),
@@ -6253,6 +8101,7 @@ function fieldLabel(field: string): string {
     version: '版本',
     business_domain: '业务域',
     description: '描述',
+    step_timeout_seconds: '单步运行上限（秒）',
     trigger_intents: '触发意图',
     user_utterance_examples: '示例话术',
     goal: '目标',
@@ -6264,6 +8113,9 @@ function fieldLabel(field: string): string {
     instruction: '节点说明',
     expected_user_info: '期望字段',
     allowed_actions: '允许动作',
+    general_skill_ids: 'SOP 技能',
+    tool_ids: 'SOP 工具',
+    knowledge_base_ids: 'SOP 知识库',
   };
   return labels[field] || field;
 }

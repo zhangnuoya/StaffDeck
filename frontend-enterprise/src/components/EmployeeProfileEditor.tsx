@@ -34,6 +34,7 @@ type EmployeeProfileFormValues = {
   workStyles: string[];
   expertiseTags: string[];
   workModes: string[];
+  harnessMaxActions: number;
   status: 'active' | 'archived';
   runtime: AgentRuntime;
   codexModel: string;
@@ -54,6 +55,7 @@ const BLANK_FORM: EmployeeProfileFormValues = {
   workStyles: [],
   expertiseTags: [],
   workModes: [],
+  harnessMaxActions: 32,
   status: 'active',
   runtime: AgentRuntime.Native,
   codexModel: '',
@@ -91,6 +93,7 @@ export default function EmployeeProfileEditor({
       workStyles: profile.workStyles,
       expertiseTags: profile.expertiseTags,
       workModes: profile.workModes,
+      harnessMaxActions: Math.max(1, Math.min(100, agent.harness_max_actions || 32)),
       status: agent.status === 'archived' ? 'archived' : 'active',
       runtime: parseAgentRuntime(agent.runtime),
       codexModel: typeof agent.runtime_config?.model === 'string' ? agent.runtime_config.model : '',
@@ -138,6 +141,7 @@ export default function EmployeeProfileEditor({
           form.runtime === AgentRuntime.Codex && form.codexModel.trim()
             ? { model: form.codexModel.trim() }
             : {},
+        harness_max_actions: Math.max(1, Math.min(100, form.harnessMaxActions || 32)),
         metadata,
       });
       notify.success('数字员工档案已更新');
@@ -243,6 +247,31 @@ export default function EmployeeProfileEditor({
               <LabeledField label="岗位执行约束">
                 <Textarea rows={4} value={form.personaPrompt} placeholder="员工在对话中的角色、人设、回复风格和执行边界" onChange={(event) => update({ personaPrompt: event.target.value })} />
               </LabeledField>
+              <LabeledField label="默认模型">
+                <div className="flex min-h-10 items-center rounded-[10px] border border-[#e3e7f1] bg-[#f7f8fa] px-3 text-[13px] text-[#59627a]">
+                  统一继承模型配置中的全局默认模型
+                </div>
+                <span className="text-[11px] text-muted-foreground">员工不再单独绑定模型；切换全局默认模型后，所有员工立即生效。</span>
+              </LabeledField>
+
+              <div className="rounded-[14px] border border-[#e3e7f1] bg-[#fafbfc] p-[14px]">
+                <LabeledField label="单次 HarnessLoop 最大调用轮次">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={100}
+                    step={1}
+                    value={form.harnessMaxActions}
+                    onChange={(event) => {
+                      const next = Number(event.target.value);
+                      update({ harnessMaxActions: Number.isFinite(next) ? next : 32 });
+                    }}
+                  />
+                </LabeledField>
+                <p className="m-0 mt-[6px] text-[11px] leading-[1.5] text-muted-foreground">
+                  限制该员工在一轮对话中可自主执行的模型动作与能力调用总数，范围 1–100；达到上限后未完成任务会进入后续轮次。
+                </p>
+              </div>
 
               <div className="employee-profile-form-grid is-tags">
                 <LabeledField label="掌握方向">

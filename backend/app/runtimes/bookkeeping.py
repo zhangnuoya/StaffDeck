@@ -5,10 +5,11 @@ from typing import Any
 from sqlmodel import Session
 
 from app.channels.service_outbox import stage_channel_delivery
-from app.core.legacy_conversation_projection import LegacyConversationProjection
+from app.core.conversation_projection import ConversationProjection
 from app.db.models import ChatSession, Message, new_id, utc_now
 from app.observability.event_log import EventLog
 from app.session.helpers import public_session
+from app.session.origin import PILOTDECK_GROUP_CHAT_CHANNEL
 from app.session.session_schema import ChatTurnRequest
 
 
@@ -22,6 +23,11 @@ def get_or_create_session(db: Session, request: ChatTurnRequest) -> ChatSession:
             tenant_id=request.tenant_id,
             user_id=request.user_id,
             agent_id=request.agent_id,
+            channel=(
+                PILOTDECK_GROUP_CHAT_CHANNEL
+                if request.channel == PILOTDECK_GROUP_CHAT_CHANNEL
+                else None
+            ),
         )
         db.add(chat_session)
         db.flush()
@@ -60,7 +66,7 @@ def mark_session_running(db: Session, chat_session: ChatSession) -> None:
 
 
 def fallback_session_title(message: str) -> str:
-    return LegacyConversationProjection.fallback_session_title(message)
+    return ConversationProjection.fallback_session_title(message)
 
 
 def finalize_simple_turn(
