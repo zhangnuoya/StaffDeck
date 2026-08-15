@@ -11,6 +11,7 @@ from app.agents.branching import agent_private_metadata
 from app.db import get_session
 from app.db.models import (
     AgentEvent,
+    AgentKnowledgeBranch,
     AgentProfile,
     AgentResourceBinding,
     GeneralSkill,
@@ -177,6 +178,9 @@ def test_initialize_and_tools_list() -> None:
         # seed 中 agent_codex 未绑定任何通用技能：描述不含个性化清单
         skill_tool = next(tool for tool in tools if tool["name"] == "run_general_skill")
         assert "Available skills" not in skill_tool["description"]
+        # seed 中 agent_codex 未绑定任何知识库：query_knowledge 描述同样不含清单
+        kb_tool = next(tool for tool in tools if tool["name"] == "query_knowledge")
+        assert "Available knowledge bases" not in kb_tool["description"]
 
         unknown = client.post(f"/api/mcp/{token}", json=_rpc("resources/list"))
         assert unknown.json()["error"]["code"] == -32601
@@ -325,6 +329,47 @@ def test_run_general_skill_description_lists_bound_skills() -> None:
         other_tools = other.json()["result"]["tools"]
         other_skill = next(tool for tool in other_tools if tool["name"] == "run_general_skill")
         assert "Available skills" not in other_skill["description"]
+
+
+def test_query_knowledge_description_lists_bound_knowledge_bases() -> None:
+    """tools/list 里 query_knowledge 的描述带员工可见知识库名称清单（按 agent 隔离）。"""
+    with _make_db() as db:
+        _seed(db)
+        db.add(
+            AgentKnowledgeBranch(
+                id=new_id("agentkb"),
+                tenant_id="tenant_demo",
+                agent_id="agent_codex",
+                knowledge_base_id="kb_policy",
+            )
+        )
+        db.add(
+            AgentResourceBinding(
+                id=new_id("agentres"),
+                tenant_id="tenant_demo",
+                agent_id="agent_codex",
+                resource_type="knowledge_base",
+                resource_id="kb_policy",
+                status="active",
+                metadata_json=agent_private_metadata("agent_codex"),
+            )
+        )
+        db.commit()
+        client = _make_client(db)
+
+        listed = client.post(f"/api/mcp/{_token()}", json=_rpc("tools/list"))
+        tools = listed.json()["result"]["tools"]
+        kb_tool = next(tool for tool in tools if tool["name"] == "query_knowledge")
+        assert "Available knowledge bases" in kb_tool["description"]
+        assert "制度库" in kb_tool["description"]
+
+        # 其他员工（未绑定）看不到该知识库清单
+        other = client.post(
+            f"/api/mcp/{_token(agent_id='agent_other')}", json=_rpc("tools/list")
+        )
+        other_tools = other.json()["result"]["tools"]
+        other_kb = next(tool for tool in other_tools if tool["name"] == "query_knowledge")
+        assert "Available knowledge bases" not in other_kb["description"]
 
 
 def test_unknown_gateway_tool_is_a_jsonrpc_error() -> None:

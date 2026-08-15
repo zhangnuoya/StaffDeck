@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 from app.agents.branching import model_for_agent, visible_knowledge_base_ids, visible_tool_rows
 from app.capabilities.contracts import CapabilityContext, GeneralSkillSummary
 from app.capabilities.local_general_skill import LocalGeneralSkillCatalog
-from app.db.models import GeneralSkill, new_id
+from app.db.models import GeneralSkill, KnowledgeBase, new_id
 from app.general_skills.runner import GeneralSkillRunner
 from app.knowledge.schema import KnowledgeSearchRequest
 from app.knowledge.service import KnowledgeService
@@ -36,6 +36,7 @@ class GatewayToolError(Exception):
 
 def _builtin_tool_descriptors(
     general_skills: Sequence[GeneralSkillSummary] | None = None,
+    knowledge_bases: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     # 员工绑定的已发布技能清单动态拼进 run_general_skill 描述：
     # 外部运行时（codex 等）只看到这一个入口工具，没有清单会盲试 slug。
@@ -43,12 +44,19 @@ def _builtin_tool_descriptors(
     if general_skills:
         listing = ", ".join(f"{skill.slug}: {skill.name}" for skill in general_skills)
         skill_hint = f" Available skills: [{listing}]."
+    # 员工可见知识库名称清单拼进 query_knowledge 描述：没有清单外部模型
+    # 只能盲搜（不知道有哪些库），无法在查询里主动指明来源。
+    kb_hint = ""
+    if knowledge_bases:
+        listing = ", ".join(knowledge_bases)
+        kb_hint = f" Available knowledge bases: [{listing}]."
     return [
         {
             "name": "query_knowledge",
             "description": (
-                "Search the enterprise knowledge bases bound to this digital employee. "
-                "Returns the top matching chunks with citation labels."
+                "Search the enterprise knowledge bases bound to this digital employee."
+                + kb_hint
+                + " Returns the top matching chunks with citation labels."
             ),
             "inputSchema": {
                 "type": "object",
@@ -116,7 +124,8 @@ def gateway_tool_descriptors(db: Session, grant: CapabilityGrant) -> list[dict[s
         channel="mcp",
     )
     visible_skills = LocalGeneralSkillCatalog(db).list_published(context)
-    descriptors = _builtin_tool_descriptors(visible_skills)
+    knowledge_bases = _visible_knowledge_base_names(db, grant)
+    descriptors = _builtin_tool_descriptors(visible_skills, knowledge_bases)
     seen = {entry["name"] for entry in descriptors}
     tools = visible_tool_rows(db, grant.tenant_id, grant.agent_id, include_inactive=False)
     for tool in tools:
@@ -144,6 +153,20 @@ def _sanitize_tool_name(name: str) -> str:
     """``github.create_issue`` -> ``github_create_issue``; trim to 64 chars."""
     sanitized = _MCP_NAME_RE.sub("_", str(name or "")).strip("_")
     return sanitized[:64]
+
+
+def _visible_knowledge_base_names(db: Session, grant: CapabilityGrant) -> list[str]:
+    """员工可见知识库的名称清单（注入 query_knowledge 描述，按员工隔离）。"""
+    kb_ids = visible_knowledge_base_ids(db, grant.tenant_id, grant.agent_id)
+    if not kb_ids:
+        return []
+    rows = db.exec(
+        select(KnowledgeBase.name).where(
+            KnowledgeBase.tenant_id == grant.tenant_id,
+            KnowledgeBase.id.in_(kb_ids),
+        )
+    ).all()
+    return sorted(name for name in rows if name)
 
 
 def execute_gateway_tool(
