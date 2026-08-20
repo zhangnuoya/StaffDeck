@@ -39,6 +39,11 @@ from app.observability.event_log import EventLog
 from app.runtimes import bookkeeping
 from app.runtimes.adapters._cli_common import kill_process_tree, parse_jsonl, reply_chunks
 from app.runtimes.contracts import AgentRuntimeKind
+from app.runtimes.memory_bridge import (
+    enqueue_cli_memory_capture,
+    recall_memory_context,
+    render_memory_section,
+)
 from app.session.helpers import public_session
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 
@@ -223,7 +228,19 @@ class CodexAgentRuntime:
         except OSError:
             workspace_before = None
         is_resume = bool(runtime_state.get("thread_id"))
-        prompt = self._build_prompt(request, chat_session, agent, user_message.id, is_resume)
+        memories = recall_memory_context(
+            self._db, request.tenant_id, request.user_id, chat_session.agent_id
+        )
+        if memories:
+            self._events.record(
+                request.tenant_id,
+                chat_session.id,
+                "memory_recalled",
+                {"memories": memories, "runtime": AgentRuntimeKind.CODEX.value},
+            )
+        prompt = self._build_prompt(
+            request, chat_session, agent, user_message.id, is_resume, memories
+        )
         self._db.commit()
         self._db.refresh(chat_session)
         self._db.refresh(user_message)
@@ -265,16 +282,23 @@ class CodexAgentRuntime:
         agent: AgentProfile | None,
         user_message_id: str,
         is_resume: bool,
+        memories: list[dict[str, Any]] | None = None,
     ) -> str:
         message = request.message
         attachment_text = self._attachment_text(request)
         if attachment_text:
             message = f"{message}\n\n{attachment_text}"
         if is_resume:
-            return message
+            # resume 轮同样注入记忆：codex thread 上下文不会因记忆更新而刷新，
+            # 每轮前置最新记忆段保证与库内记忆一致。
+            memory_section = render_memory_section(memories or [], latest=True)
+            return f"{memory_section}\n\n{message}" if memory_section else message
         sections: list[str] = []
         if agent:
             sections.append(AgentIdentityPrompt.render(agent))
+        memory_section = render_memory_section(memories or [])
+        if memory_section:
+            sections.append(memory_section)
         sections.append(
             "你能通过名为 staffdeck 的 MCP 工具集访问该员工绑定的企业能力。"
             "业务工具已按原生名称在工具清单中列出，请直接按名调用（不要用 call_tool 包装）；"
@@ -598,7 +622,7 @@ class CodexAgentRuntime:
         prepared.reply = (pending_agent_text or "").strip() or "（Codex 未返回文本回复）"
         if streaming and prepared.reply != (pending_agent_text or ""):
             yield self._event(prepared, "stream_replace", {"content": prepared.reply}, persist=True)
-        self._finalize(prepared)
+        self._finalize(prepared, memory_capture=True)
         if streaming:
             yield self._event(prepared, "stream_end", {}, persist=True)
             yield self._event(
@@ -644,7 +668,9 @@ class CodexAgentRuntime:
         ):
             prepared.knowledge_results.append(structured)
 
-    def _finalize(self, prepared: _PreparedTurn, cancelled: bool = False) -> None:
+    def _finalize(
+        self, prepared: _PreparedTurn, cancelled: bool = False, memory_capture: bool = False
+    ) -> None:
         session = prepared.chat_session
         state = dict(prepared.runtime_state)
         state["runtime"] = AgentRuntimeKind.CODEX.value
@@ -691,6 +717,12 @@ class CodexAgentRuntime:
             extra_metadata=extra_metadata,
         )
         self._db.commit()
+        # 轮后记忆提取：仅成功完成的轮（失败/取消轮经 _fail_turn/
+        # _finalize(cancelled=True) 进入，不提取）。必须在 commit 之后入队：
+        # 后台 job 用独立连接读本轮消息，未提交事务对它不可见。
+        if memory_capture and not cancelled:
+            enqueue_cli_memory_capture(self._db, self._events, prepared.request, session.id)
+            self._db.commit()
         self._db.refresh(session)
         prepared.response = ChatTurnResponse(
             reply=prepared.reply,

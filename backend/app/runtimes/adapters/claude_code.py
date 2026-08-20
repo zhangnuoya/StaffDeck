@@ -29,6 +29,11 @@ from app.observability.event_log import EventLog
 from app.runtimes import bookkeeping
 from app.runtimes.adapters._cli_common import kill_process_tree, parse_jsonl, reply_chunks
 from app.runtimes.contracts import AgentRuntimeKind
+from app.runtimes.memory_bridge import (
+    enqueue_cli_memory_capture,
+    recall_memory_context,
+    render_memory_section,
+)
 from app.session.helpers import public_session
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 
@@ -132,11 +137,26 @@ class ClaudeCodeAgentRuntime:
         if attachment_text:
             message = f"{message}\n\n{attachment_text}"
         system_prompt = self._system_prompt(agent)
+        memories = recall_memory_context(
+            self._db, request.tenant_id, request.user_id, chat_session.agent_id
+        )
+        if memories:
+            self._events.record(
+                request.tenant_id,
+                chat_session.id,
+                "memory_recalled",
+                {"memories": memories, "runtime": AgentRuntimeKind.CLAUDE_CODE.value},
+            )
         prompt = message
         if not is_resume:
             history = self._history_text(chat_session, user_message.id)
             if history:
                 prompt = f"[对话历史]\n{history}\n\n[用户消息]\n{message}"
+        # 首轮与 resume 轮都注入记忆段（resume 时用「最新用户记忆」标注），
+        # CLI thread 自身上下文不会随库内记忆更新而刷新。
+        memory_section = render_memory_section(memories, latest=is_resume)
+        if memory_section:
+            prompt = f"{memory_section}\n\n{prompt}"
         self._db.commit()
         self._db.refresh(chat_session)
         self._db.refresh(user_message)
@@ -444,7 +464,7 @@ class ClaudeCodeAgentRuntime:
         if not reply and last_text_by_message:
             reply = max(last_text_by_message.values(), key=len).strip()
         prepared.reply = reply or "（Claude Code 未返回文本回复）"
-        self._finalize(prepared)
+        self._finalize(prepared, memory_capture=True)
         if streaming:
             yield self._event(prepared, "stream_end", {}, persist=True)
             yield self._event(
@@ -460,7 +480,9 @@ class ClaudeCodeAgentRuntime:
     # turn outcomes
     # ------------------------------------------------------------------
 
-    def _finalize(self, prepared: _PreparedTurn, cancelled: bool = False) -> None:
+    def _finalize(
+        self, prepared: _PreparedTurn, cancelled: bool = False, memory_capture: bool = False
+    ) -> None:
         session = prepared.chat_session
         state = dict(prepared.runtime_state)
         state["runtime"] = AgentRuntimeKind.CLAUDE_CODE.value
@@ -486,6 +508,11 @@ class ClaudeCodeAgentRuntime:
             extra_metadata=extra_metadata,
         )
         self._db.commit()
+        # 轮后记忆提取：仅成功完成的轮（失败/取消轮不提取，对齐原生引擎）。
+        # 必须在 commit 之后入队：后台 job 用独立连接读本轮消息。
+        if memory_capture and not cancelled:
+            enqueue_cli_memory_capture(self._db, self._events, prepared.request, session.id)
+            self._db.commit()
         self._db.refresh(session)
         prepared.response = ChatTurnResponse(
             reply=prepared.reply,
