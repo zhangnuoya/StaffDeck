@@ -181,6 +181,7 @@ class StepAgentResult(BaseModel):
     next_step_id: Optional[str] = None
     is_step_completed: bool = False
     handoff: bool = False
+    structured_result: Any | None = None
 
 
 class SessionPublic(BaseModel):
@@ -210,7 +211,21 @@ class ChatTurnRequest(BaseModel):
     message: str
     attachments: list["ChatAttachmentRead"] = Field(default_factory=list)
     channel: str = "web"
-    interaction_mode: Literal["normal", "scheduled_task"] = "normal"
+    interaction_mode: Literal["normal", "scheduled_task", "team_task", "team_tl"] = "normal"
+    # Server-only prompt prefix. It is consumed by the runtime but never persisted as
+    # the user's visible message or serialized into background-job payloads.
+    context_injection: Optional[str] = Field(default=None, exclude=True)
+    # Internal retry turns remain auditable in storage while staying out of the
+    # user-facing conversation and subsequent conversational context.
+    message_visibility: Literal["visible", "internal"] = Field(default="visible", exclude=True)
+    # Internal callers such as scheduled tasks may pin one published SOP.  This
+    # is deliberately separate from the visible message so execution does not
+    # depend on the planner rediscovering the same SOP on every wake-up.
+    forced_sop_id: Optional[str] = Field(default=None, exclude=True)
+    # Scheduled tasks may freeze the selected SOP at save time. The snapshot is
+    # server-only and is applied only after the current employee binding has
+    # been verified, so pinning a version never bypasses capability access.
+    forced_sop_snapshot: Optional[dict[str, Any]] = Field(default=None, exclude=True)
     client_timezone: Optional[str] = None
     debug: bool = False
 
@@ -233,6 +248,7 @@ class ChatAttachmentRead(BaseModel):
 class ChatTurnResponse(BaseModel):
     reply: str
     session_id: str
+    runtime_error_code: Optional[str] = None
     router_decision: Optional[RouterDecision] = None
     step_result: Optional[StepAgentResult] = None
     tool_result: Optional[ToolResult] = None
@@ -264,6 +280,8 @@ class ChatSessionRead(BaseModel):
     summary: Optional[str]
     last_agent_question: Optional[str]
     is_scheduled: bool = False
+    team_id: Optional[str] = None
+    team_name: Optional[str] = None
     created_at: str
     updated_at: str
 

@@ -2,6 +2,7 @@ from app.harness.artifacts import (
     HarnessArtifactAccessError,
     HarnessWorkspaceSnapshot,
     OpenedHarnessArtifact,
+    is_noise_artifact_path,
     normalize_harness_artifact_path,
     open_harness_artifact,
     publish_changed_harness_artifacts,
@@ -26,6 +27,7 @@ from app.harness.contracts import (
 from app.harness.errors import HarnessExecutionError
 from app.harness.executor import HarnessExecutor
 from app.harness.filesystem import (
+    ExtractDocumentTextArguments,
     PublishArtifactArguments,
     build_file_tool_registry,
     publish_artifact,
@@ -35,6 +37,7 @@ from app.harness.registry import HarnessRegistry
 
 __all__ = [
     "ExecCommandArguments",
+    "ExtractDocumentTextArguments",
     "HarnessArtifactAccessError",
     "HarnessWorkspaceSnapshot",
     "HarnessExecutionError",
@@ -51,6 +54,7 @@ __all__ = [
     "build_command_tool_registry",
     "build_file_tool_registry",
     "exec_command",
+    "is_noise_artifact_path",
     "normalize_harness_artifact_path",
     "open_harness_artifact",
     "publish_artifact",

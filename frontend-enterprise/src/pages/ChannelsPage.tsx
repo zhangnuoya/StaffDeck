@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { notify } from '@/components/ui/app-toast';
 
 import AppHeader from '@/components/AppHeader';
@@ -11,11 +12,18 @@ import {
   DialogTitle,
   RadioGroup,
   RadioGroupItem,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Switch,
 } from '@/components/ui';
 import { Button as UIButton } from '@/components/ui/button';
 
 import { api, TENANT_ID } from '../api/client';
+
+const _CHANNEL_LABELS: Record<string, string> = { feishu: '飞书', dingtalk: '钉钉', wecom: '企业微信', wechat: '微信' };
 import IconAdd from '../assets/icons/add.svg?react';
 import IconAlignJustify from '../assets/icons/align-justify.svg?react';
 import IconChat from '../assets/icons/chat.svg?react';
@@ -33,6 +41,7 @@ import type {
   ChannelBindingRead,
   ChannelBindCodeRead,
   ChannelConversationMessageRead,
+  ChannelConversationAttachment,
   ChannelConversationRead,
   ChannelDeliveryDay,
   ChannelDeliveryDayPage,
@@ -40,12 +49,19 @@ import type {
   ChannelIdentityBindingRead,
   ChannelMetaRead,
   PagedResponse,
+  TeamRead,
 } from '../types';
 import WechatSetup from './channels/WechatSetup';
 import WecomSetup from './channels/WecomSetup';
 import FeishuSetup from './channels/FeishuSetup';
 import DingTalkSetup from './channels/DingTalkSetup';
-import { getChannelPresentation } from './channelPresentation';
+import BindingManagers from './channels/BindingManagers';
+import {
+  canDeleteBinding,
+  canManageBinding,
+  getChannelPresentation,
+  ROLE_LABEL,
+} from './channelPresentation';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import { formatTime, type BadgeTone } from './scheduled-tasks/shared';
 
@@ -98,6 +114,67 @@ function messageDisplay(
     return { label: conversation.agent_name || '员工', content: msg.content };
   }
   return { label: msg.role, content: msg.content };
+}
+
+function ChannelAttachmentView({
+  attachment,
+  bindingId,
+  sessionId,
+  messageId,
+}: {
+  attachment: ChannelConversationAttachment;
+  bindingId: string;
+  sessionId: string;
+  messageId: string;
+}) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const path = `/api/enterprise/channels/${bindingId}/conversations/${sessionId}/messages/${messageId}/attachments/${attachment.id}?tenant_id=${TENANT_ID}`;
+
+  useEffect(() => {
+    if (attachment.kind !== 'image') return;
+    let disposed = false;
+    let objectUrl: string | null = null;
+    setLoading(true);
+    void api.blob(path).then((blob) => {
+      objectUrl = URL.createObjectURL(blob);
+      if (!disposed) setUrl(objectUrl);
+      else URL.revokeObjectURL(objectUrl);
+    }).catch(() => {
+      if (!disposed) setUrl(null);
+    }).finally(() => {
+      if (!disposed) setLoading(false);
+    });
+    return () => {
+      disposed = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [attachment.id, attachment.kind, path]);
+
+  if (attachment.kind === 'image') {
+    return url ? (
+      <img src={url} alt={attachment.filename} className="max-h-[220px] max-w-[320px] rounded-[8px] object-contain" />
+    ) : <span className="text-[12px] text-[#858b9c]">{loading ? '图片加载中…' : '图片暂不可用'}</span>;
+  }
+  return (
+    <button
+      type="button"
+      className="text-left text-[12px] text-[#3b63c8] underline"
+      onClick={() => void api.blob(path).then((blob) => {
+        const objectUrl = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = attachment.filename;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
+      })}
+    >
+      {attachment.filename}
+    </button>
+  );
 }
 
 function isSessionRecovering(binding: ChannelBindingRead): boolean {
@@ -166,10 +243,15 @@ export default function ChannelsPage({
   const [createOpen, setCreateOpen] = useState(false);
   const [createStep, setCreateStep] = useState<'channel' | 'agent'>('channel');
   const [createChannel, setCreateChannel] = useState('wechat');
+  const [createTarget, setCreateTarget] = useState<'agent' | 'team'>('agent');
   const [createAgentId, setCreateAgentId] = useState('');
+  const [createTeamId, setCreateTeamId] = useState('');
+  const [teams, setTeams] = useState<TeamRead[]>([]);
+  const [teamsLoading, setTeamsLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [unbindOpen, setUnbindOpen] = useState(false);
   const [unbinding, setUnbinding] = useState(false);
+  const [togglingStatus, setTogglingStatus] = useState(false);
   const [agentEditing, setAgentEditing] = useState(false);
   const [agentCandidates, setAgentCandidates] = useState<AgentProfileRead[]>([]);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
@@ -177,17 +259,41 @@ export default function ChannelsPage({
   const [defaultAgentId, setDefaultAgentId] = useState('');
   const [savingAgents, setSavingAgents] = useState(false);
   const [autoRouteSaving, setAutoRouteSaving] = useState(false);
+  const [tenantUsers, setTenantUsers] = useState<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string; external_account_scope?: string }> }>>([]);
+  const [handoffAssigneeSaving, setHandoffAssigneeSaving] = useState(false);
   const [bindCode, setBindCode] = useState<ChannelBindCodeRead | null>(null);
   const [bindCodeOpen, setBindCodeOpen] = useState(false);
   const [bindCodeLoading, setBindCodeLoading] = useState(false);
   const [bindCodeRemain, setBindCodeRemain] = useState(0);
+  const [bindCodeTargetName, setBindCodeTargetName] = useState('');
+  const [bindCodeTargetUserId, setBindCodeTargetUserId] = useState<string | undefined>();
+  const [identityInviteUserId, setIdentityInviteUserId] = useState('');
   const [identityBindings, setIdentityBindings] = useState<ChannelIdentityBindingRead[]>([]);
   const [unbindIdentityTarget, setUnbindIdentityTarget] =
     useState<ChannelIdentityBindingRead | null>(null);
   const [unbindingIdentity, setUnbindingIdentity] = useState(false);
 
   const binding = bindings.find((item) => item.id === selectedId) || null;
-  const channelIdentities = identityBindings.filter((item) => item.channel === binding?.channel);
+  const navigate = useNavigate();
+  // 身份绑定属于具体渠道账号 scope；同一用户可以分别绑定多个飞书应用。
+  const channelIdentities = identityBindings.filter(
+    (item) =>
+      item.channel === binding?.channel &&
+      (item.external_account_scope || '') === (binding?.identity_scope_key || ''),
+  );
+  const bindingScope = binding?.identity_scope_key || '';
+  const identityBoundUsers = tenantUsers.filter((user) =>
+    user.channel_identities?.some(
+      (identity) =>
+        identity.channel === binding?.channel &&
+        (identity.external_account_scope || '') === bindingScope,
+    ),
+  );
+  const identityUnboundUsers = tenantUsers.filter(
+    (user) =>
+      (!user.source || user.source === 'web') &&
+      !identityBoundUsers.some((bound) => bound.id === user.id),
+  );
   const bindCodeChannelName = binding
     ? channelName(binding.channel)
     : getChannelPresentation(createChannel).name;
@@ -199,6 +305,17 @@ export default function ChannelsPage({
 
   function ifStale(snapshot: string): boolean {
     return snapshot !== selectedIdRef.current;
+  }
+
+  async function loadTenantUsers() {
+    try {
+      const rows = await api.get<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string; external_account_scope?: string }> }>>(
+        `/api/auth/users?tenant_id=${TENANT_ID}&include_channel=true`,
+      );
+      setTenantUsers(rows);
+    } catch {
+      setTenantUsers([]);
+    }
   }
 
   useEffect(() => {
@@ -219,6 +336,8 @@ export default function ChannelsPage({
     void load();
     void loadIdentityBindings();
     void loadChannelMetas();
+    void loadTeams();
+    void loadTenantUsers();
   }, []);
 
   useEffect(() => {
@@ -369,6 +488,29 @@ export default function ChannelsPage({
     }
   }
 
+  async function loadTeams() {
+    setTeamsLoading(true);
+    try {
+      const rows = await api.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`);
+      setTeams(rows);
+    } catch {
+      // 团队列表仅用于绑定对象选择与名称映射，失败不影响主流程
+      setTeams([]);
+    } finally {
+      setTeamsLoading(false);
+    }
+  }
+
+  function teamNameFor(item: ChannelBindingRead): string {
+    if (!item.team_id) return '';
+    return item.team_name || teams.find((team) => team.id === item.team_id)?.name || '团队';
+  }
+
+  function teamLeaderName(teamId: string): string {
+    const team = teams.find((item) => item.id === teamId);
+    return team?.members.find((member) => member.role === 'leader')?.agent_name || '未设置';
+  }
+
   async function loadAgentCandidates() {
     setCandidatesLoading(true);
     try {
@@ -389,23 +531,30 @@ export default function ChannelsPage({
   function openCreate() {
     setCreateStep('channel');
     setCreateChannel(channelMetas[0]?.channel || 'wechat');
+    setCreateTarget('agent');
     setCreateAgentId('');
+    setCreateTeamId('');
     setCreateOpen(true);
     void loadAgentCandidates();
+    void loadTeams();
   }
 
   async function createBinding() {
-    if (!createAgentId || creating) return;
+    const agentId = createTarget === 'agent' ? createAgentId : '';
+    const teamId = createTarget === 'team' ? createTeamId : '';
+    if ((!agentId && !teamId) || creating) return;
     setCreating(true);
     try {
       const created = await api.post<ChannelBindingRead>('/api/enterprise/channels', {
         tenant_id: TENANT_ID,
-        agent_id: createAgentId,
+        // agent_id 与 team_id 互斥，后端二选一
+        ...(agentId ? { agent_id: agentId } : { team_id: teamId }),
         channel: createChannel,
       });
       notify.success('渠道接入创建成功');
       setCreateOpen(false);
       setCreateAgentId('');
+      setCreateTeamId('');
       await load();
       setSelectedId(created.id);
     } catch (error) {
@@ -415,14 +564,24 @@ export default function ChannelsPage({
     }
   }
 
-  async function openBindCode() {
+  async function openBindCode(targetUserId?: string) {
     if (bindCodeLoading) return;
     setBindCodeLoading(true);
     try {
-      const result = await api.post<ChannelBindCodeRead>(
-        `/api/enterprise/channels/bind-code?tenant_id=${TENANT_ID}`,
-      );
+      const target = targetUserId
+        ? tenantUsers.find((user) => user.id === targetUserId)
+        : currentUser;
+      const result = targetUserId && binding
+        ? await api.post<ChannelBindCodeRead>(
+            `/api/enterprise/channels/${binding.id}/identity-bind-code?tenant_id=${TENANT_ID}`,
+            { user_id: targetUserId },
+          )
+        : await api.post<ChannelBindCodeRead>(
+            `/api/enterprise/channels/bind-code?tenant_id=${TENANT_ID}`,
+          );
       setBindCode(result);
+      setBindCodeTargetName(target?.display_name || target?.username || '当前用户');
+      setBindCodeTargetUserId(targetUserId);
       setBindCodeOpen(true);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '生成绑定码失败');
@@ -455,6 +614,22 @@ export default function ChannelsPage({
       notify.error(error instanceof Error ? error.message : '断开接入失败');
     } finally {
       setUnbinding(false);
+    }
+  }
+
+  async function toggleStatus() {
+    if (!binding) return;
+    setTogglingStatus(true);
+    try {
+      const updated = await api.post<ChannelBindingRead>(
+        `/api/enterprise/channels/${binding.id}/toggle-status?tenant_id=${TENANT_ID}`,
+      );
+      setBindings((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      notify.success(updated.status === 'active' ? '已启用渠道' : '已停用渠道');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '切换状态失败');
+    } finally {
+      setTogglingStatus(false);
     }
   }
 
@@ -523,6 +698,25 @@ export default function ChannelsPage({
       notify.error(error instanceof Error ? error.message : '更新智能分发设置失败');
     } finally {
       setAutoRouteSaving(false);
+    }
+  }
+
+  async function saveHandoffAssignee(userId: string | null) {
+    if (!binding || handoffAssigneeSaving) return;
+    setHandoffAssigneeSaving(true);
+    try {
+      const updated = await api.put<ChannelBindingRead>(
+        `/api/enterprise/channels/${binding.id}?tenant_id=${TENANT_ID}`,
+        { tenant_id: TENANT_ID, default_handoff_assignee_user_id: userId },
+      );
+      setBindings((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      notify.success('已保存');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '保存默认人工处理人失败');
+    } finally {
+      setHandoffAssigneeSaving(false);
     }
   }
 
@@ -661,8 +855,12 @@ export default function ChannelsPage({
                   <span>{formatTime(item.created_at)}</span>
                 </div>
                 <div className="flex flex-wrap items-center gap-[6px]">
-                  <span className="text-[12px] text-[#858b9c]">可调度员工</span>
-                  {(item.agents || []).length === 0 ? (
+                  <span className="text-[12px] text-[#858b9c]">
+                    {item.team_id ? '绑定团队' : '可调度员工'}
+                  </span>
+                  {item.team_id ? (
+                    <StatusBadge tone="blue">{`团队 · ${teamNameFor(item)}`}</StatusBadge>
+                  ) : (item.agents || []).length === 0 ? (
                     <span className="text-[12px] text-[#858b9c]">暂无可调度员工</span>
                   ) : (
                     (item.agents || []).map((agent) => (
@@ -719,15 +917,32 @@ export default function ChannelsPage({
             <span className="truncate text-[12px] text-[#858b9c]">
               创建者：{binding.created_by_name || '-'}
             </span>
+            {binding.my_role && (
+              <span className="rounded-[6px] bg-[#f0f1f5] px-[6px] py-[2px] text-[11px] text-[#858b9c]">
+                {ROLE_LABEL[binding.my_role] || binding.my_role}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-[8px]">
-            <UIButton
-              variant="outline"
-              onClick={() => setUnbindOpen(true)}
-              className={OUTLINE_BUTTON_CLASS}
-            >
-              断开接入
-            </UIButton>
+            {canManageBinding(binding) && (
+              <UIButton
+                variant="outline"
+                onClick={() => void toggleStatus()}
+                disabled={togglingStatus}
+                className={OUTLINE_BUTTON_CLASS}
+              >
+                {binding.status === 'active' ? '停用' : '启用'}
+              </UIButton>
+            )}
+            {canDeleteBinding(binding) && (
+              <UIButton
+                variant="outline"
+                onClick={() => setUnbindOpen(true)}
+                className={OUTLINE_BUTTON_CLASS}
+              >
+                断开接入
+              </UIButton>
+            )}
           </div>
         </div>
         {binding.status === 'expired' && setupKindFor(binding.channel) !== 'qrcode' && (
@@ -778,6 +993,58 @@ export default function ChannelsPage({
             onCheckedChange={(next) => void toggleAutoRoute(next)}
           />
         </div>
+        <div className="flex items-center justify-between gap-[12px] border-t border-[#eef0f4] pt-[16px]">
+          <div className="flex min-w-0 flex-col gap-[4px]">
+            <span className="text-[13px] font-semibold text-[#18181a]">默认人工处理人</span>
+            <span className="text-[12px] leading-[1.6] text-[#858b9c]">
+              SOP 人工节点未指定处理人时，转交给此用户。未配置时回退到数字员工负责人或管理员。
+            </span>
+          </div>
+          <div className="flex items-center gap-[8px]">
+            {binding.default_handoff_assignee_name && (
+              <span className="text-[12px] text-[#858b9c]">
+                当前：{binding.default_handoff_assignee_name}
+              </span>
+            )}
+            <Select
+              value={binding.default_handoff_assignee_user_id || '__none__'}
+              disabled={handoffAssigneeSaving}
+              onValueChange={(value) => void saveHandoffAssignee(value === '__none__' ? null : value)}
+            >
+              <SelectTrigger className="h-[32px] w-[160px] text-[12px]">
+                <SelectValue placeholder="选择处理人" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__none__">未配置</SelectItem>
+                {tenantUsers.filter((user) => !user.source || user.source === 'web').map((user) => {
+                  const scope = binding.identity_scope_key || '';
+                  const matchingIdentity = user.channel_identities?.find(
+                    (ci) => ci.channel === binding.channel && (ci.external_account_scope || '') === scope,
+                  );
+                  if (binding.channel === 'feishu' && !matchingIdentity) return null;
+                  const channelLabel = matchingIdentity
+                    ? ` (${_CHANNEL_LABELS[matchingIdentity.channel] || matchingIdentity.channel} 可达)`
+                    : user.channel_identities?.[0]
+                      ? ` (${_CHANNEL_LABELS[user.channel_identities[0].channel] || user.channel_identities[0].channel})`
+                      : '';
+                  const name = user.display_name || user.username || user.id;
+                  return (
+                    <SelectItem key={user.id} value={user.id}>
+                      {name}{channelLabel}
+                    </SelectItem>
+                  );
+                })}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        {canDeleteBinding(binding) && (
+          <BindingManagers
+            bindingId={binding.id}
+            users={tenantUsers}
+            creatorUserId={binding.created_by_user_id}
+          />
+        )}
       </div>
 
       <section aria-label={activeChannel ? `${activeChannel.name}身份绑定` : '身份绑定'}>
@@ -821,6 +1088,52 @@ export default function ChannelsPage({
               </UIButton>
             </div>
           )}
+          {canManageBinding(binding) && binding.channel === 'feishu' && (
+            <div className="mt-[4px] flex flex-col gap-[10px] border-t border-[#eef0f4] pt-[12px]">
+              <div className="flex flex-col gap-[3px]">
+                <span className="text-[12px] font-medium text-[#18181a]">邀请成员绑定飞书身份</span>
+                <span className="text-[11px] leading-[1.6] text-[#858b9c]">
+                  每位成员需用自己的飞书账号向当前机器人发送一次性绑定指令。
+                </span>
+              </div>
+              {identityBoundUsers.length > 0 && (
+                <div className="flex flex-wrap gap-[6px]">
+                  {identityBoundUsers.map((user) => (
+                    <StatusBadge key={user.id} tone="green">
+                      {`${user.display_name || user.username} 已绑定`}
+                    </StatusBadge>
+                  ))}
+                </div>
+              )}
+              {identityUnboundUsers.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-[8px]">
+                  <Select value={identityInviteUserId || '__none__'} onValueChange={(value) => setIdentityInviteUserId(value === '__none__' ? '' : value)}>
+                    <SelectTrigger className="h-[32px] w-[180px] text-[12px]">
+                      <SelectValue placeholder="选择内部成员" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">选择内部成员</SelectItem>
+                      {identityUnboundUsers.map((user) => (
+                        <SelectItem key={user.id} value={user.id}>
+                          {user.display_name || user.username || user.id}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <UIButton
+                    variant="outline"
+                    disabled={!identityInviteUserId || bindCodeLoading}
+                    onClick={() => void openBindCode(identityInviteUserId)}
+                    className={OUTLINE_BUTTON_CLASS}
+                  >
+                    生成绑定指令
+                  </UIButton>
+                </div>
+              ) : (
+                <span className="text-[11px] text-[#858b9c]">所有内部成员均已绑定当前飞书应用</span>
+              )}
+            </div>
+          )}
         </div>
       </section>
 
@@ -830,7 +1143,7 @@ export default function ChannelsPage({
             <IconAccount className="size-[14px] shrink-0" />
             <span className="text-[14px] font-normal leading-none">可调度员工</span>
           </div>
-          {!agentEditing && (
+          {!agentEditing && !binding.team_id && (
             <UIButton variant="outline" onClick={openAgentEdit} className={OUTLINE_BUTTON_CLASS}>
               编辑
             </UIButton>
@@ -839,7 +1152,13 @@ export default function ChannelsPage({
         <p className="mb-[16px] px-[12px] text-[12px] text-[#858b9c]">
           挂载后，该渠道的所有用户均可与这些员工对话。
         </p>
-        {agentEditing ? (
+        {binding.team_id ? (
+          <div className="flex flex-wrap items-center gap-[8px] rounded-[14px] border border-[#eef0f4] p-[16px]">
+            <span className="text-[13px] text-[#18181a]">
+              {`团队：${teamNameFor(binding)}（项目领导：${teamLeaderName(binding.team_id)}）`}
+            </span>
+          </div>
+        ) : agentEditing ? (
           <div className="flex flex-col gap-[12px] rounded-[14px] border border-[#eef0f4] p-[16px]">
             {candidatesLoading ? (
               <span className="py-[12px] text-center text-[12px] text-[#858b9c]">加载中…</span>
@@ -966,9 +1285,22 @@ export default function ChannelsPage({
                       <span className="text-[11px] text-[#a0a6b8]">
                         {shown.label} · {formatTime(msg.created_at)}
                       </span>
-                      <span className="wrap-break-word rounded-[10px] bg-[#f6f6f6] px-[12px] py-[8px] text-[13px] leading-[1.6] text-[#18181a]">
-                        {shown.content}
-                      </span>
+                       <div className="wrap-break-word rounded-[10px] bg-[#f6f6f6] px-[12px] py-[8px] text-[13px] leading-[1.6] text-[#18181a]">
+                         {shown.content}
+                         {msg.attachments?.length ? (
+                           <span className="mt-[8px] flex flex-col gap-[6px]">
+                             {msg.attachments.map((attachment) => (
+                               <ChannelAttachmentView
+                                 key={attachment.id}
+                                 attachment={attachment}
+                                 bindingId={binding?.id || ''}
+                                 sessionId={activeConversation.session_id}
+                                 messageId={msg.id}
+                               />
+                             ))}
+                           </span>
+                         ) : null}
+                       </div>
                     </div>
                   );
                 })}
@@ -1131,9 +1463,7 @@ export default function ChannelsPage({
           className="flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[480px]"
         >
           <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
-            {createStep === 'channel'
-              ? '选择渠道'
-              : `选择${getChannelPresentation(createChannel, metaFor(createChannel)?.name).name}默认员工`}
+            {createStep === 'channel' ? '选择渠道' : '选择绑定对象'}
           </DialogTitle>
           <div className="min-h-0 flex-1 overflow-y-auto">
             {createStep === 'channel' ? (
@@ -1173,26 +1503,96 @@ export default function ChannelsPage({
                   ))}
                 </div>
               )
-            ) : candidatesLoading ? (
-              <div className="py-[24px] text-center text-[12px] text-[#858b9c]">加载中…</div>
-            ) : agentCandidates.length === 0 ? (
-              <div className="py-[24px] text-center text-[12px] text-[#858b9c]">暂无可用员工</div>
             ) : (
-              <RadioGroup
-                value={createAgentId}
-                onValueChange={setCreateAgentId}
-                className="grid gap-[10px]"
-              >
-                {agentCandidates.map((agent) => (
-                  <div
-                    key={agent.id}
-                    className="flex items-center gap-[8px] text-[13px] text-[#18181a]"
-                  >
-                    <RadioGroupItem value={agent.id} />
-                    <span className="min-w-0 flex-1 truncate">{employeeDisplayName(agent)}</span>
+              <div className="flex flex-col gap-[12px]">
+                <div className="flex rounded-[10px] bg-[#f2f3f7] p-[4px]">
+                  {(
+                    [
+                      { key: 'agent', label: '数字员工' },
+                      { key: 'team', label: '团队' },
+                    ] as const
+                  ).map((option) => (
+                    <button
+                      key={option.key}
+                      type="button"
+                      onClick={() => setCreateTarget(option.key)}
+                      className={cn(
+                        'flex-1 rounded-[8px] py-[6px] text-[12px] transition-colors',
+                        createTarget === option.key
+                          ? 'bg-white font-medium text-[#18181a]'
+                          : 'text-[#858b9c] hover:text-[#18181a]',
+                      )}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                {createTarget === 'agent' ? (
+                  candidatesLoading ? (
+                    <div className="py-[24px] text-center text-[12px] text-[#858b9c]">加载中…</div>
+                  ) : agentCandidates.length === 0 ? (
+                    <div className="py-[24px] text-center text-[12px] text-[#858b9c]">
+                      暂无可用员工
+                    </div>
+                  ) : (
+                    <RadioGroup
+                      value={createAgentId}
+                      onValueChange={setCreateAgentId}
+                      className="grid gap-[10px]"
+                    >
+                      {agentCandidates.map((agent) => (
+                        <div
+                          key={agent.id}
+                          className="flex items-center gap-[8px] text-[13px] text-[#18181a]"
+                        >
+                          <RadioGroupItem value={agent.id} />
+                          <span className="min-w-0 flex-1 truncate">
+                            {employeeDisplayName(agent)}
+                          </span>
+                        </div>
+                      ))}
+                    </RadioGroup>
+                  )
+                ) : teamsLoading ? (
+                  <div className="py-[24px] text-center text-[12px] text-[#858b9c]">加载中…</div>
+                ) : teams.length === 0 ? (
+                  <div className="flex flex-col items-center gap-[12px] py-[24px] text-[12px] text-[#858b9c]">
+                    <span>暂无可用团队</span>
+                    <UIButton
+                      variant="outline"
+                      onClick={() => {
+                        setCreateOpen(false);
+                        navigate('/enterprise/teams');
+                      }}
+                      className={OUTLINE_BUTTON_CLASS}
+                    >
+                      去创建团队
+                    </UIButton>
                   </div>
-                ))}
-              </RadioGroup>
+                ) : (
+                  <RadioGroup
+                    value={createTeamId}
+                    onValueChange={setCreateTeamId}
+                    className="grid gap-[10px]"
+                  >
+                    {teams.map((team) => (
+                      <div
+                        key={team.id}
+                        className="flex items-center gap-[8px] text-[13px] text-[#18181a]"
+                      >
+                        <RadioGroupItem value={team.id} />
+                        <span className="min-w-0 flex-1 truncate">{team.name}</span>
+                        <span className="shrink-0 text-[12px] text-[#858b9c]">
+                          {`项目领导：${team.members.find((member) => member.role === 'leader')?.agent_name || '未设置'}`}
+                        </span>
+                        <span className="shrink-0 text-[12px] text-[#858b9c]">
+                          {`${team.members.length} 名成员`}
+                        </span>
+                      </div>
+                    ))}
+                  </RadioGroup>
+                )}
+              </div>
             )}
           </div>
           <div className="flex justify-end gap-[8px]">
@@ -1215,7 +1615,9 @@ export default function ChannelsPage({
             {createStep === 'agent' && (
               <UIButton
                 onClick={() => void createBinding()}
-                disabled={!createAgentId || creating}
+                disabled={
+                  (createTarget === 'agent' ? !createAgentId : !createTeamId) || creating
+                }
                 className={PRIMARY_BUTTON_CLASS}
               >
                 {`创建${getChannelPresentation(createChannel, metaFor(createChannel)?.name).name}接入`}
@@ -1229,7 +1631,11 @@ export default function ChannelsPage({
         open={bindCodeOpen}
         onOpenChange={(open) => {
           setBindCodeOpen(open);
-          if (!open) void loadIdentityBindings();
+          if (!open) {
+            void loadIdentityBindings();
+            void loadTenantUsers();
+            void load();
+          }
         }}
       >
         <DialogContent
@@ -1237,7 +1643,7 @@ export default function ChannelsPage({
           className="flex w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[420px]"
         >
           <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
-            {`绑定我的${bindCodeChannelName}`}
+            {`绑定${bindCodeTargetName ? ` ${bindCodeTargetName} 的` : ''}${bindCodeChannelName}身份`}
           </DialogTitle>
           {bindCode && (
             <div className="flex flex-col items-center gap-[12px]">
@@ -1260,11 +1666,11 @@ export default function ChannelsPage({
                 </UIButton>
               </div>
               <span className="text-center text-[12px] leading-[1.6] text-[#858b9c]">
-                {`请在${bindCodeChannelName}中向你的数字员工发送以上指令，完成身份绑定。`}
+                {`请让${bindCodeTargetName || '该成员'}使用自己的${bindCodeChannelName}账号向当前机器人发送以上指令。`}
               </span>
               {bindCodeRemain === 0 && (
                 <UIButton
-                  onClick={() => void openBindCode()}
+                  onClick={() => void openBindCode(bindCodeTargetUserId)}
                   disabled={bindCodeLoading}
                   className={PRIMARY_BUTTON_CLASS}
                 >

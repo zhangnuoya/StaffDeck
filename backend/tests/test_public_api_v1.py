@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -18,6 +20,7 @@ from app.db.models import (
     Skill,
     Tenant,
     User,
+    utc_now,
 )
 from app.api.agents import (
     create_agent_api_credential,
@@ -652,6 +655,7 @@ def test_run_handler_relays_live_public_trace_and_returns_citations(monkeypatch)
                     payload_json={
                         "decision": "answer_only",
                         "reason": "policy query",
+                        "client_turn_id": request.client_turn_id,
                         "system_prompt": "must not leak",
                     },
                 )
@@ -683,6 +687,16 @@ def test_run_handler_relays_live_public_trace_and_returns_citations(monkeypatch)
                     session_id=request.session_id,
                     event_type="stream_delta",
                     payload_json={"content": "制度答复 [1]", "turn_id": request.client_turn_id},
+                    # A late database insert may carry an older source timestamp.
+                    created_at=utc_now() - timedelta(days=1),
+                )
+            )
+            self.db.add(
+                AgentEvent(
+                    tenant_id=request.tenant_id,
+                    session_id=request.session_id,
+                    event_type="stream_delta",
+                    payload_json={"content": "另一轮内容", "client_turn_id": "other-run"},
                 )
             )
             self.db.add(
@@ -710,6 +724,11 @@ def test_run_handler_relays_live_public_trace_and_returns_citations(monkeypatch)
     assert "system_prompt" not in plan_event.data_json
     output_event = next(event for event in public_events if event.event_type == "run.output.delta")
     assert output_event.data_json["content"] == "制度答复 [1]"
+    assert not any(
+        event.data_json.get("content") == "另一轮内容"
+        for event in public_events
+        if event.event_type == "run.output.delta"
+    )
     completed_event = next(
         event for event in public_events if event.event_type == "run.output.completed"
     )
@@ -1046,3 +1065,24 @@ def test_public_api_rejects_new_full_access_employee_keys(monkeypatch) -> None:
     )
     assert credential.status_code == 400
     assert credential.json()["code"] == "AGENT_SCOPE_INVALID"
+
+
+def test_internal_job_remains_durably_queued_when_executor_is_stopping(monkeypatch) -> None:
+    _client_instance, engine, _admin_token = _client(monkeypatch)
+
+    def reject_submission(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("executor is shutting down")
+
+    monkeypatch.setattr(public_jobs, "enqueue_async_job", reject_submission)
+    with Session(engine) as db:
+        created = public_jobs.create_internal_job(
+            db,
+            tenant_id="tenant_api",
+            kind="feedback.analyze",
+            request_payload={"feedback_id": "feedback-1"},
+        )
+        persisted = db.get(APIJob, created.id)
+
+    assert persisted is not None
+    assert persisted.status == "queued"
+    assert persisted.credential_id == "internal"

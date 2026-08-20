@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import base64
 import hashlib
-import inspect
 import json
 import mimetypes
 import time
@@ -14,7 +14,6 @@ from sqlmodel import Session, select
 
 from app.capabilities.local_general_skill import (
     package_from_row,
-    runtime_snapshot_from_package,
 )
 from app.core.capability_discovery import (
     CAPABILITY_SEARCH_MAX_RESULTS,
@@ -42,10 +41,6 @@ from app.db.models import (
     UIConfig,
     new_id,
     utc_now,
-)
-from app.general_skills.runner import (
-    GeneralSkillExecutionCancelled,
-    GeneralSkillRunner,
 )
 from app.harness import (
     HarnessArtifactAccessError,
@@ -159,10 +154,6 @@ class HarnessCapabilityInvoker:
                 if name in self._descriptors
             }
         )
-        # GeneralSkill is a two-stage capability in Harness v2.  The task agent
-        # must inspect the frozen package before it can decide whether the
-        # instructions are sufficient or executable code is actually needed.
-        self._loaded_general_skill_ids: set[str] = set()
 
     def invoke(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self._raise_if_cancelled()
@@ -615,177 +606,35 @@ class HarnessCapabilityInvoker:
         query = str(arguments.get("query") or "").strip()
         if not query:
             return _failure("INVALID_ARGUMENTS", "通用技能 query 不能为空。")
-        # Fail safe for old callers that omit operation: loading instructions is
-        # non-executing and gives the AgentLoop enough context to choose its next
-        # action.  Never turn an omitted field into generated code.
-        operation = str(arguments.get("operation") or "read").strip().lower()
-        if operation not in {"read", "execute"}:
+        # GeneralSkill is an instruction package.  Loading it enriches the same
+        # isolated AgentLoop transcript; execution remains the responsibility of
+        # the regular Harness tools.  Accept legacy ``execute`` calls as a safe
+        # alias for ``read`` so persisted model/tool calls do not suddenly fail,
+        # but never start the old generated-runner pipeline from business runs.
+        requested_operation = str(arguments.get("operation") or "read").strip().lower()
+        if requested_operation not in {"read", "execute"}:
             return _failure(
                 "INVALID_ARGUMENTS",
-                "通用技能 operation 只能是 read 或 execute。",
+                "通用技能 operation 只能是 read。",
             )
-        if operation == "read":
-            result = self._read_general_skill_package(skill, metadata, query)
-            self._loaded_general_skill_ids.add(skill.id)
-            self._emit_trace(
-                "general_skill_trace",
-                {
-                    "skill_slug": skill.slug,
-                    "skill_name": skill.name,
-                    "operation": "read",
-                    "phase": "instructions_loaded",
-                    "message": "已加载技能说明，等待 AgentLoop 判断执行方式",
-                },
+        result = self._read_general_skill_package(skill, metadata, query)
+        if requested_operation == "execute":
+            result["data"]["requested_operation"] = "execute"
+            result["data"]["compatibility_notice"] = (
+                "execute 已弃用并安全降级为 read；请按 SKILL.md 指导调用现有 Harness 工具。"
             )
-            return result
-
-        if skill.id not in self._loaded_general_skill_ids:
-            return _failure(
-                "GENERAL_SKILL_NOT_INSPECTED",
-                (
-                    "执行技能包前必须先使用 operation=read 加载说明；"
-                    "由 AgentLoop 阅读后判断是否确实需要运行代码。"
-                ),
-            )
-
-        package = package_from_row(skill)
-        snapshot = runtime_snapshot_from_package(skill, package)
-        try:
-            run_kwargs = {
-                "max_attempts": _general_skill_max_attempts(skill),
-                "event_sink": lambda item: self._emit_trace(
-                    "general_skill_trace",
-                    {
-                        "skill_slug": skill.slug,
-                        "skill_name": skill.name,
-                        "operation": "execute",
-                        **item,
-                    },
-                ),
-            }
-            run_kwargs.update(
-                workspace_root=self.workspace_root,
-                is_cancelled=self.is_cancelled,
-                sandbox_network_mode=self._sandbox_network_mode,
-                sandbox_allowed_domains=self._sandbox_allowed_domains,
-                sandbox_enabled=self._sandbox_enabled,
-            )
-            runner = GeneralSkillRunner()
-            supported = inspect.signature(runner.run).parameters
-            if "sandbox_enabled" not in supported:
-                run_kwargs.pop("sandbox_enabled", None)
-            if "sandbox_network_mode" not in supported:
-                if self._sandbox_network_mode != "all":
-                    raise HarnessExecutionError(
-                        "SANDBOX_POLICY_UNSUPPORTED",
-                        "通用技能执行器不支持当前租户的沙盒网络策略，已拒绝执行。",
-                    )
-                # Legacy runners cannot weaken an unrestricted policy. Keep
-                # this compatibility path only for the explicit `all` mode.
-                run_kwargs.pop("sandbox_network_mode", None)
-                run_kwargs.pop("sandbox_allowed_domains", None)
-            response = runner.run(
-                snapshot, query, self.model_config, self.session.user_id, **run_kwargs
-            )
-        except HarnessExecutionError as exc:
-            code = str(exc.error.code or "SANDBOX_EXECUTION_FAILED")
-            message = str(exc.error.message or exc)
-            self._emit_trace(
-                "general_skill_run_finished",
-                {
-                    "skill_slug": skill.slug,
-                    "operation": "execute",
-                    "success": False,
-                    "error": code,
-                    "message": message,
-                },
-            )
-            return _failure(
-                code,
-                message,
-                retryable=False,
-                infrastructure_failure=True,
-            )
-        except GeneralSkillExecutionCancelled as exc:
-            self._emit_trace(
-                "general_skill_run_finished",
-                {
-                    "skill_slug": skill.slug,
-                    "operation": "execute",
-                    "success": False,
-                    "status": "cancelled",
-                },
-            )
-            raise HarnessExecutionCancelled(str(exc)) from exc
-
-        structured = (
-            dict(response.structured_result)
-            if isinstance(response.structured_result, dict)
-            else {}
-        )
-        declared_success = structured.get("success")
-        succeeded = True if declared_success is None else bool(declared_success)
-        artifact_errors: list[dict[str, str]] = [
-            {
-                "path": str(item.get("path") or ""),
-                "code": str(item.get("code") or "artifact_declaration_invalid"),
-                "message": str(item.get("message") or "产物声明无效。"),
-            }
-            for item in (structured.get("artifact_errors") or [])[:20]
-            if isinstance(item, dict)
-        ]
-        artifacts, publish_errors = self._general_skill_artifacts(
-            response.artifacts
-            or [
-                item
-                for item in (structured.get("artifacts") or [])[:20]
-                if isinstance(item, dict)
-            ],
-            skill_slug=skill.slug,
-        )
-        artifact_errors.extend(publish_errors)
-        data = {
-            "kind": "general_skill",
-            "slug": response.skill_slug,
-            "operation": response.operation,
-            "query": query,
-            "reply": response.reply,
-            "structured_result": structured,
-            "stdout": response.stdout,
-            "stderr": response.stderr,
-            "generated_code": response.generated_code,
-            "execution_trace": response.execution_trace,
-            "artifact_errors": artifact_errors,
-        }
         self._emit_trace(
-            "general_skill_run_finished",
+            "general_skill_trace",
             {
-                "skill_slug": response.skill_slug,
-                "operation": response.operation,
-                "success": succeeded,
-                "structured_result": structured,
-                "stdout_preview": response.stdout[:600],
-                "stderr_preview": response.stderr[:600],
+                "skill_slug": skill.slug,
+                "skill_name": skill.name,
+                "operation": "read",
+                "requested_operation": requested_operation,
+                "phase": "instructions_loaded",
+                "message": "已加载技能说明，AgentLoop 将按说明选择 Harness 工具",
             },
         )
-        if succeeded:
-            return {"success": True, "data": data, "artifacts": artifacts}
-        return {
-            "success": False,
-            "data": data,
-            "artifacts": artifacts,
-            "error": {
-                "code": str(
-                    structured.get("error") or "GENERAL_SKILL_EXECUTION_FAILED"
-                ),
-                "message": str(
-                    structured.get("message")
-                    or response.reply
-                    or "通用技能执行失败。"
-                ),
-                "retryable": bool(structured.get("retryable")),
-            },
-        }
+        return result
 
     def _general_skill_artifacts(
         self,
@@ -873,9 +722,9 @@ class HarnessCapabilityInvoker:
                 "package": _skill_package_preview(skill),
                 "notice": (
                     "技能包说明已加载到当前隔离 Harness transcript；"
-                    "请由 AgentLoop 判断下一步：仅含 prompt、规则或示例时直接应用说明，"
-                    "并按任务需要调用知识库、原装 Tool 或文件工具；只有确实需要运行"
-                    "技能包代码时才使用 operation=execute。"
+                    "请由 AgentLoop 直接应用其中的 prompt、规则和示例，并按任务需要调用"
+                    "知识库、原装 Tool、exec_command 或 typed 文件工具；Skill 本身不会"
+                    "生成临时代码或启动第二套 runner。"
                 ),
             },
         }
@@ -994,6 +843,7 @@ class HarnessCapabilityInvoker:
             active_skill_id=self.active_skill_id,
             agent_id=self.agent_id,
             session_id=self.session.id,
+            invocation_id=call_id,
             timeout_seconds_override=self._remaining_step_seconds(),
         )
         payload = result.model_dump(mode="json")
@@ -1008,6 +858,9 @@ class HarnessCapabilityInvoker:
             payload.pop("structured", None)
         if payload.get("success") is not True:
             return payload
+        a2a_artifacts = self._materialize_a2a_artifacts(payload, call_id=call_id)
+        if a2a_artifacts:
+            payload["artifacts"] = [*(payload.get("artifacts") or []), *a2a_artifacts]
         payload = self._persist_large_json_result(payload, call_id=call_id)
         if isinstance(app_descriptor, dict) and payload.get("success") is True:
             app_descriptor["initial_result"] = payload.get("data")
@@ -1019,6 +872,68 @@ class HarnessCapabilityInvoker:
                 },
             )
         return payload
+
+    def _materialize_a2a_artifacts(
+        self,
+        payload: dict[str, Any],
+        *,
+        call_id: str,
+    ) -> list[dict[str, Any]]:
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("artifacts"), list):
+            return []
+        published: list[dict[str, Any]] = []
+        directory = self.workspace_root / "artifacts" / "a2a" / _safe_artifact_name(call_id)
+        for artifact_index, artifact in enumerate(data["artifacts"], start=1):
+            if not isinstance(artifact, dict):
+                continue
+            for part_index, part in enumerate(artifact.get("parts") or [], start=1):
+                if not isinstance(part, dict) or not isinstance(part.get("file"), dict):
+                    continue
+                file_part = part["file"]
+                encoded = file_part.get("bytes")
+                if not isinstance(encoded, str) or not encoded:
+                    continue
+                try:
+                    content = base64.b64decode(encoded, validate=True)
+                except ValueError:
+                    continue
+                requested_name = str(file_part.get("name") or "").strip()
+                filename = _safe_artifact_name(
+                    requested_name or f"artifact-{artifact_index}-{part_index}.bin"
+                )
+                directory.mkdir(parents=True, exist_ok=True)
+                output = directory / filename
+                suffix = 2
+                while output.exists():
+                    output = directory / f"{Path(filename).stem}-{suffix}{Path(filename).suffix}"
+                    suffix += 1
+                output.write_bytes(content)
+                relative = output.relative_to(self.workspace_root).as_posix()
+                sha256 = hashlib.sha256(content).hexdigest()
+                content_type = str(file_part.get("mimeType") or "").strip() or (
+                    mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                )
+                file_part.pop("bytes", None)
+                file_part["path"] = relative
+                file_part["sandbox_path"] = _sandbox_path(relative)
+                file_part["sha256"] = sha256
+                published.append(
+                    {
+                        "type": "workspace_file",
+                        "task_frame_id": self.task_frame_id,
+                        "path": relative,
+                        "sandbox_path": _sandbox_path(relative),
+                        "sha256": sha256,
+                        "size": len(content),
+                        "display_name": requested_name or filename,
+                        "description": str(artifact.get("description") or "A2A Artifact"),
+                        "content_type": content_type,
+                        "operation": "a2a_artifact",
+                        "source": "a2a",
+                    }
+                )
+        return published
 
     def _persist_large_json_result(
         self,
@@ -1212,19 +1127,6 @@ def _workspace_root(
     )
 
 
-def _general_skill_max_attempts(skill: GeneralSkill) -> int:
-    runtime_config = (
-        skill.runtime_config_json
-        if isinstance(skill.runtime_config_json, dict)
-        else {}
-    )
-    try:
-        configured = int(runtime_config.get("max_attempts") or 3)
-    except (TypeError, ValueError):
-        configured = 3
-    return max(1, min(configured, 10))
-
-
 def _intersect_knowledge_metadata(
     frozen: dict[str, Any],
     current: dict[str, Any],
@@ -1414,6 +1316,14 @@ def _sandbox_path(relative_path: str) -> str:
     if normalized in {"", "."}:
         return SANDBOX_WORKSPACE
     return f"{SANDBOX_WORKSPACE}/{normalized.lstrip('/')}"
+
+
+def _safe_artifact_name(value: str) -> str:
+    cleaned = "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "-"
+        for character in Path(str(value or "artifact").replace("\\", "/")).name
+    ).strip(".-")
+    return cleaned[:180] or "artifact"
 
 
 def _model_visible_file_result(value: Any, *, key: str = "") -> Any:

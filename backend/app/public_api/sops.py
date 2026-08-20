@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from sqlmodel import Session, select
 
 from app.api import skills as internal_skills
+from app.agents.branching import visible_skill_rows
 from app.db import get_session
 from app.db.models import (
     APIJob,
@@ -40,6 +41,7 @@ from app.skills.skill_schema import (
     SkillRewriteRequest,
     SkillUpdateRequest,
 )
+from app.skills.nesting import SopNestingError, validate_sop_nesting
 
 
 router = APIRouter(tags=["sops"])
@@ -192,6 +194,25 @@ def validate_draft(db: Session, row: APISOPDraft) -> dict[str, Any]:
     try:
         card = SkillCard.model_validate(row.content_json)
         field_errors: list[dict[str, str]] = _validate_capability_refs(db, row, card)
+        try:
+            validate_sop_nesting(
+                card.skill_id,
+                card.model_dump(mode="json"),
+                visible_skill_rows(
+                    db,
+                    row.tenant_id,
+                    row.agent_id,
+                    include_inactive=True,
+                ),
+            )
+        except SopNestingError as exc:
+            field_errors.append(
+                {
+                    "path": "nodes.sub_sop_id",
+                    "code": "INVALID_SOP_NESTING",
+                    "detail": str(exc),
+                }
+            )
     except ValidationError as exc:
         field_errors = [
             {
@@ -369,13 +390,17 @@ def execute_sop_rewrite(db: Session, job: APIJob) -> dict[str, Any]:
     update_job(db, job, stage="rewriting", progress=0.15, event_type="sop.rewrite.rewriting")
     request = SkillRewriteRequest(
         tenant_id=job.tenant_id,
+        agent_id=str(job.agent_id),
         current_skill=SkillCard.model_validate(payload["current_skill"]),
         instruction=str(payload["instruction"]),
         target_paths=list(payload.get("target_paths") or []),
         model_config_id=payload.get("model_config_id"),
     )
     model = internal_skills._get_request_model(db, job.tenant_id, request.model_config_id)
-    result = SkillEditor().rewrite(internal_skills._with_available_tools_for_rewrite(db, request), model)
+    result = SkillEditor().rewrite(
+        internal_skills._with_available_context_for_rewrite(db, request),
+        model,
+    )
     row = _new_draft(
         db,
         tenant_id=job.tenant_id,

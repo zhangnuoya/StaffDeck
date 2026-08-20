@@ -8,6 +8,7 @@ import { pinyin } from 'pinyin-pro';
 import { api, TENANT_ID } from '../api/client';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
+import CapabilityScopeLoading from '@/components/CapabilityScopeLoading';
 import {
   CapabilityScopeBadge,
   CapabilityScopeControl,
@@ -37,6 +38,7 @@ import {
 import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
+import { announceEnterpriseCapabilityCatalogChange } from '@/lib/capability-catalog-events';
 import {
   MENU_CONTENT_CLASS,
   MENU_ITEM_CLASS,
@@ -65,6 +67,7 @@ import {
   visibleEmployeeAgents,
 } from '../employee';
 import { useClientPagination } from '../hooks/useClientPagination';
+import { isTeamScope, readEmployeeScope } from '../lib/agent-scope-storage';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import type {
   AgentProfileRead,
@@ -117,7 +120,7 @@ const TRANSPORT_OPTIONS: { value: MCPTransport; label: string; hint: string }[] 
 
 export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {}) {
   const [rows, setRows] = useState<ToolRead[]>([]);
-  const [agentId, setAgentId] = useState(() => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '');
+  const [agentId, setAgentId] = useState(readEmployeeScope);
   const [isOverallAgent, setIsOverallAgent] = useState(true);
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [bucketFilter, setBucketFilter] = useState('__all__');
@@ -196,8 +199,8 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
-      const nextAgentId = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '';
-      setAgentId(nextAgentId);
+      const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
@@ -276,6 +279,10 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
       await api.delete(`/api/enterprise/tools/${row.id}?tenant_id=${TENANT_ID}${agentSuffix}`);
       notify.success(isOverallAgent ? '已删除工具' : '已从当前员工移除');
+      announceEnterpriseCapabilityCatalogChange({
+        resourceType: 'tool',
+        agentId: agentId || undefined,
+      });
       setDeleteTarget(null);
       await load();
     } catch (error) {
@@ -312,6 +319,10 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         `/api/enterprise/mcp-servers/${row.id}?tenant_id=${TENANT_ID}${agentQuery}&remove_tools=true`,
       );
       notify.success(isOverallAgent ? '已删除' : '已从当前员工移除');
+      announceEnterpriseCapabilityCatalogChange({
+        resourceType: 'tool',
+        agentId: agentId || undefined,
+      });
       setServerDeleteTarget(null);
       void load();
     } catch (error) {
@@ -402,6 +413,10 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       const importedCount = result.imported?.length || 0;
       const missingCount = result.missing?.length || 0;
       notify.success(`已复制 ${importedCount} 个工具${missingCount ? `，${missingCount} 个未复制` : ''}`);
+      announceEnterpriseCapabilityCatalogChange({
+        resourceType: 'tool',
+        agentId: agentId || undefined,
+      });
       setImportOpen(false);
       if (targetAgentId !== agentId) {
         window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, targetAgentId);
@@ -672,6 +687,8 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
   const listEmptyText = isOverallAgent
     ? canManageCurrentScope ? '暂无工具，点击「新增」创建一个吧' : '暂无工具'
     : '当前员工暂无工具';
+
+  if (!agentScopeLoaded) return <CapabilityScopeLoading />;
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
@@ -1079,6 +1096,10 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
         ? await api.put<ToolRead>(`/api/enterprise/tools/${toolId}${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload)
         : await api.post<ToolRead>(`/api/enterprise/tools${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload);
       notify.success('已保存');
+      announceEnterpriseCapabilityCatalogChange({
+        resourceType: 'tool',
+        agentId: readEmployeeScope() || undefined,
+      });
       setTool(saved);
       setValues(toolToFormValues(saved));
       if (!isEdit) {
@@ -1457,6 +1478,10 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
         ? await api.put<MCPServerRead>(`/api/enterprise/mcp-servers/${serverId}`, built.payload)
         : await api.post<MCPServerRead>('/api/enterprise/mcp-servers', built.payload);
       notify.success('已保存');
+      announceEnterpriseCapabilityCatalogChange({
+        resourceType: 'tool',
+        agentId: readEmployeeScope() || undefined,
+      });
       setServer(saved);
       setValues(serverToFormValues(saved));
       if (!isEdit) {
@@ -1523,6 +1548,10 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
         return;
       }
       notify.success(`同步完成：新增 ${response.imported.length}，更新 ${response.updated.length}`);
+      announceEnterpriseCapabilityCatalogChange({
+        resourceType: 'tool',
+        agentId: readEmployeeScope() || undefined,
+      });
       try {
         const refreshed = await api.get<MCPServerRead>(
           `/api/enterprise/mcp-servers/${server.id}?tenant_id=${TENANT_ID}`,
@@ -2206,7 +2235,7 @@ async function loadBucketOptions() {
 }
 
 function currentAgentQuery() {
-  const agentId = window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '';
+  const agentId = readEmployeeScope();
   return agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
 }
 
@@ -2242,7 +2271,7 @@ function buildToolPayload(values: ToolFormValues) {
       auth: parseJson(values.auth, {}),
       mcp_config: values.tool_type === 'mcp' || values.tool_type === 'a2a' ? parseJson(values.mcp_config, {}) : {},
       execution_policy: {
-        timeout_seconds: Math.max(1, Math.min(300, Number(values.timeout_seconds) || 8)),
+        timeout_seconds: Math.max(1, Math.min(3600, Number(values.timeout_seconds) || 8)),
       },
       input_schema: parseJson(values.input_schema, {}),
       output_schema: parseJson(values.output_schema, {}),

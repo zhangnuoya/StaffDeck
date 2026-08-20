@@ -172,6 +172,7 @@ class LLMClient:
         self.api_protocol = protocol
         self.api_key = api_key
         self.model = model_config.model
+        self.model_config_name = str(getattr(model_config, "name", "") or "").strip()
         self.temperature = model_config.temperature
         self.max_output_tokens = model_config.max_output_tokens
         legacy_extra_body = getattr(model_config, "legacy_extra_body", {})
@@ -205,6 +206,8 @@ class LLMClient:
         )
         context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
+        if response_format and response_format.get("type") == "json_object":
+            request_messages = _with_json_mode_instruction(request_messages)
         request_messages = _fit_request_messages(request_messages)
         if isinstance(user_payload, dict) and isinstance(
             user_payload.get(STAGE_PROTOCOL_KEY), dict
@@ -238,6 +241,7 @@ class LLMClient:
                 request["max_tokens"] = current_max_tokens
                 span = start_llm_call(
                     model=self.model,
+                    model_name=self.model_config_name or self.model,
                     endpoint=_endpoint_label(getattr(self, "base_url", "")),
                     request_kind=self._protocol_driver().request_kind,
                     stream=False,
@@ -332,6 +336,7 @@ class LLMClient:
             for attempt in range(empty_response_retries + 1):
                 span = start_llm_call(
                     model=self.model,
+                    model_name=self.model_config_name or self.model,
                     endpoint=_endpoint_label(getattr(self, "base_url", "")),
                     request_kind=self._protocol_driver().request_kind,
                     stream=True,
@@ -754,6 +759,24 @@ def _request_messages(
     elif not context_messages:
         messages.append({"role": "user", "content": "{}"})
     return messages
+
+
+def _with_json_mode_instruction(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    projected = copy.deepcopy(messages)
+    instruction = (
+        "Return exactly one valid json object. Do not output Markdown, code fences, "
+        "explanations, or extra text."
+    )
+    for message in reversed(projected):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content.append({"type": "text", "text": instruction})
+        else:
+            message["content"] = f"{str(content or '').rstrip()}\n\n{instruction}".strip()
+        break
+    return projected
 
 
 def _messages_have_images(messages: list[dict[str, Any]]) -> bool:

@@ -1,6 +1,7 @@
+import os
 import threading
 import time
-import os
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.pool import StaticPool
@@ -8,13 +9,15 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 import app.channels.service_intake as intake_module
 import app.core.agent_loop as agent_loop_module
+from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
 from app.channels.service_identity import channel_username
 from app.channels.service_intake import (
-    _send_wechat_typing as _real_send_wechat_typing,
-)
-from app.channels.service_intake import (
+    _message_text,
     _session_lock,
     process_inbound,
+)
+from app.channels.service_intake import (
+    _send_wechat_typing as _real_send_wechat_typing,
 )
 from app.db.models import (
     ChannelBinding,
@@ -84,13 +87,40 @@ def _load_binding(engine, binding_id: str) -> ChannelBinding:
         return binding
 
 
+def test_channel_only_attachment_uses_default_message_intent() -> None:
+    binding = ChannelBinding(tenant_id="tenant_demo", agent_id="agent_1", channel="wecom")
+    image = ChannelInbound(
+        channel="wecom",
+        event_id="evt-image",
+        from_user_id="user-1",
+        to_user_id="bot-1",
+        session_id="user-1",
+        group_id="",
+        context_token="user-1",
+        text="",
+        is_group=False,
+        raw={},
+        attachments=[ChannelInboundAttachment(media_id="image", kind="image")],
+    )
+    file = ChannelInbound(
+        **{
+            **image.__dict__,
+            "event_id": "evt-file",
+            "attachments": [ChannelInboundAttachment(media_id="file", kind="file")],
+        }
+    )
+
+    assert _message_text(binding, image) == "请读取并用一句话概括。"
+    assert _message_text(binding, file) == "请读取并用一句话概括。"
+
+
 class RecordingAgentLoop:
     """替代真实 AgentLoop：记录请求并模拟用户/助手消息落库。"""
 
     calls: list = []
     error: Exception | None = None
 
-    def __init__(self, db):
+    def __init__(self, db, *, event_sink=None):
         self.db = db
 
     def handle_turn(self, request):
@@ -317,6 +347,62 @@ def test_failure_marks_event_failed_and_stages_error_notice() -> None:
         assert notices[0].target_json["to_user_id"] == "user_ab12cd34@im.wechat"
 
 
+def test_harness_conflict_keeps_inbound_retryable_and_stages_terminal_notice(monkeypatch) -> None:
+    engine = _test_engine()
+    binding_id = _seed_binding(engine)
+    binding = _load_binding(engine, binding_id)
+
+    class ConflictAgentLoop:
+        def __init__(self, db, *, event_sink=None):
+            self.db = db
+
+        def handle_turn(self, request):  # noqa: ANN001
+            return SimpleNamespace(
+                runtime_error_code="HARNESS_SESSION_BUSY",
+                reply="当前会话仍有任务执行，请稍后重试。",
+            )
+
+    monkeypatch.setattr(agent_loop_module, "AgentLoop", ConflictAgentLoop)
+
+    assert process_inbound(binding, _p2p_message("evt_conflict"), db_engine=engine) is False
+
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        assert event.status == "received"
+        assert event.processor_run_id is None
+        notices = db.exec(
+            select(ChannelDelivery).where(ChannelDelivery.kind == "notice")
+        ).all()
+        assert len(notices) == 1
+        assert notices[0].target_json["reaction_final"] is True
+        assert notices[0].idempotency_key.endswith(":evt_conflict")
+
+
+def test_legacy_dict_harness_conflict_is_also_retryable(monkeypatch) -> None:
+    engine = _test_engine()
+    binding_id = _seed_binding(engine)
+    binding = _load_binding(engine, binding_id)
+
+    class ConflictAgentLoop:
+        def __init__(self, db, *, event_sink=None):
+            self.db = db
+
+        def handle_turn(self, request):  # noqa: ANN001
+            return {"reply": "HARNESS_TURN_CONFLICT"}
+
+    monkeypatch.setattr(agent_loop_module, "AgentLoop", ConflictAgentLoop)
+
+    assert process_inbound(binding, _p2p_message("evt_legacy_conflict"), db_engine=engine) is False
+
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        assert event.status == "received"
+        assert event.processor_run_id is None
+        notice = db.exec(select(ChannelDelivery).where(ChannelDelivery.kind == "notice")).one()
+        assert notice.text == "HARNESS_TURN_CONFLICT"
+        assert notice.target_json["reaction_final"] is True
+
+
 def test_non_text_message_is_dropped_silently() -> None:
     engine = _test_engine()
     binding_id = _seed_binding(engine)
@@ -540,6 +626,7 @@ def _seed_stale_event(
     age_seconds: float,
     payload: dict | None = None,
     processor_run_id: str | None = None,
+    lease_seconds: float | None = None,
 ) -> None:
     from datetime import timedelta
 
@@ -553,6 +640,11 @@ def _seed_stale_event(
                 payload_json=payload or {},
                 status=status,
                 processor_run_id=processor_run_id,
+                processor_lease_expires_at=(
+                    utc_now() + timedelta(seconds=lease_seconds)
+                    if lease_seconds is not None
+                    else None
+                ),
                 updated_at=utc_now() - timedelta(seconds=age_seconds),
             )
         )
@@ -616,6 +708,53 @@ def test_current_run_processing_event_is_never_taken_over_by_age() -> None:
         event = db.exec(select(ChannelInboundEvent)).one()
         assert event.status == "processing"
         assert event.processor_run_id == intake_module.current_processor_run_id()
+
+
+def test_other_process_active_lease_is_not_taken_over() -> None:
+    from app.channels.service_intake import sweep_stale_inbound_events
+
+    engine = _test_engine()
+    binding_id = _seed_binding(engine)
+    _seed_stale_event(
+        engine,
+        binding_id,
+        "evt_active_lease",
+        status="processing",
+        age_seconds=900,
+        payload=_p2p_message("evt_active_lease"),
+        processor_run_id="other_live_process",
+        lease_seconds=600,
+    )
+
+    assert sweep_stale_inbound_events(db_engine=engine) == 0
+    assert RecordingAgentLoop.calls == []
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        assert event.status == "processing"
+        assert event.processor_run_id == "other_live_process"
+
+
+def test_other_process_expired_lease_is_taken_over() -> None:
+    from app.channels.service_intake import sweep_stale_inbound_events
+
+    engine = _test_engine()
+    binding_id = _seed_binding(engine)
+    _seed_stale_event(
+        engine,
+        binding_id,
+        "evt_expired_lease",
+        status="processing",
+        age_seconds=900,
+        payload=_p2p_message("evt_expired_lease"),
+        processor_run_id="dead_process",
+        lease_seconds=-1,
+    )
+
+    assert sweep_stale_inbound_events(db_engine=engine) == 1
+    assert len(RecordingAgentLoop.calls) == 1
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        assert event.status == "done"
 
 
 def test_stale_claim_is_released_when_recovery_logic_raises(monkeypatch) -> None:
@@ -719,7 +858,7 @@ def test_concurrent_sweeps_claim_old_event_once(tmp_path) -> None:
     with Session(engine) as db:
         event = db.exec(select(ChannelInboundEvent)).one()
         assert event.status == "done"
-        assert event.processor_run_id == intake_module.current_processor_run_id()
+        assert event.processor_run_id is None
 
 
 def test_done_event_is_never_taken_over() -> None:
@@ -949,8 +1088,8 @@ def test_concurrent_sweeps_stage_one_incomplete_notice(tmp_path) -> None:
 
 def test_inbound_attachment_download_failure_degrades_to_text(monkeypatch) -> None:
     """渠道附件下载异常时不阻塞文本轮,降级为纯文本处理。"""
-    from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
     import app.channels.attachment_bridge as bridge_module
+    from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
 
     engine = _test_engine()
     binding_id = _seed_binding(engine)
@@ -994,8 +1133,8 @@ def test_inbound_attachment_download_failure_degrades_to_text(monkeypatch) -> No
 
 def test_inbound_with_attachments_passes_them_to_request(monkeypatch) -> None:
     """附件下载成功时,attachments 被填入 ChatTurnRequest。"""
-    from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
     import app.channels.attachment_bridge as bridge_module
+    from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
     from app.session.session_schema import ChatAttachmentRead
 
     engine = _test_engine()

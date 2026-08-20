@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from sqlmodel import Session
@@ -22,10 +22,16 @@ class NativeAgentRuntime:
     def __init__(self, db: Session) -> None:
         self._db = db
 
-    def handle_turn(self, request: ChatTurnRequest) -> ChatTurnResponse:
+    def handle_turn(
+        self, request: ChatTurnRequest, *, event_sink: Callable[[str, dict[str, Any]], None] | None = None
+    ) -> ChatTurnResponse:
         from app.core.agent_loop import AgentLoop
 
-        return AgentLoop(self._db).handle_turn(request)
+        # event_sink 仅在显式提供时传入:测试常用仅接受 (db) 的 FakeAgentLoop
+        # monkeypatch 该接缝,无条件传参会破坏这一兼容契约。
+        if event_sink is None:
+            return AgentLoop(self._db).handle_turn(request)
+        return AgentLoop(self._db, event_sink=event_sink).handle_turn(request)
 
     def handle_turn_stream(self, request: ChatTurnRequest) -> Iterator[dict[str, Any]]:
         from app.core.agent_loop import AgentLoop

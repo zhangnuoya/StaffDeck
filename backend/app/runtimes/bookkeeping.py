@@ -24,8 +24,8 @@ def get_or_create_session(db: Session, request: ChatTurnRequest) -> ChatSession:
             user_id=request.user_id,
             agent_id=request.agent_id,
             channel=(
-                PILOTDECK_GROUP_CHAT_CHANNEL
-                if request.channel == PILOTDECK_GROUP_CHAT_CHANNEL
+                request.channel
+                if request.channel in {PILOTDECK_GROUP_CHAT_CHANNEL, "skill_test"}
                 else None
             ),
         )

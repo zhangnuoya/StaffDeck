@@ -18,6 +18,7 @@ import { ContextMenu } from 'radix-ui';
 import { api, streamPost, TENANT_ID } from '../api/client';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
+import CapabilityScopeLoading from '@/components/CapabilityScopeLoading';
 import {
   CapabilityScopeBadge,
   CapabilityScopeControl,
@@ -46,6 +47,7 @@ import {
 import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { cn } from '@/lib/utils';
+import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
 import {
   MENU_CONTENT_CLASS,
   MENU_ITEM_CLASS,
@@ -193,7 +195,7 @@ function TraceDisclosureLabel() {
 }
 
 const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
-const GENERAL_SKILL_RUN_TIMEOUT_MS = 120_000;
+const GENERAL_SKILL_RUN_IDLE_TIMEOUT_MS = 600_000;
 const FOLDER_INPUT_PROPS = {
   webkitdirectory: '',
   directory: '',
@@ -343,7 +345,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | GeneralSkillRead['status']>('all');
-  const [agentId, setAgentId] = useState(() => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '');
+  const [agentId, setAgentId] = useState(readEmployeeScope);
   const [isOverallAgent, setIsOverallAgent] = useState(true);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [clawhubModalOpen, setClawhubModalOpen] = useState(false);
@@ -415,8 +417,8 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
-      const detail = (event as CustomEvent<{ agentId?: string }>).detail;
-      setAgentId(detail?.agentId || window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '');
+      const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
@@ -763,6 +765,8 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const listEmptyText = isOverallAgent
     ? canManageCurrentScope ? '暂无技能，点击「新增」创建一个吧' : '暂无技能'
     : '当前员工暂无技能';
+
+  if (!agentScopeLoaded) return <CapabilityScopeLoading />;
 
   return (
     <div className={embedded ? undefined : 'min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]'}>
@@ -1456,7 +1460,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   const [agentImportSourceAgentId, setAgentImportSourceAgentId] = useState('');
   const [agentImportSourceSkills, setAgentImportSourceSkills] = useState<GeneralSkillRead[]>([]);
   const [agentImportSelectedSkillIds, setAgentImportSelectedSkillIds] = useState<string[]>([]);
-  const [agentId, setAgentId] = useState(() => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '');
+  const [agentId, setAgentId] = useState(readEmployeeScope);
   const [isOverallAgent, setIsOverallAgent] = useState(true);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [deleteSkillTarget, setDeleteSkillTarget] = useState<GeneralSkillRead | null>(null);
@@ -1576,8 +1580,8 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       if (forceGalleryScope) return;
-      const detail = (event as CustomEvent<{ agentId?: string }>).detail;
-      setAgentId(detail?.agentId || window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '');
+      const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
@@ -2237,10 +2241,24 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     });
     const controller = new AbortController();
     let timedOut = false;
-    const timeoutId = window.setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, GENERAL_SKILL_RUN_TIMEOUT_MS);
+    let debugSessionId = '';
+    let debugTurnId = '';
+    const receivedTrace: Record<string, unknown>[] = [];
+    let timeoutId = 0;
+    const resetIdleTimeout = () => {
+      window.clearTimeout(timeoutId);
+      timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        if (debugSessionId && debugTurnId) {
+          void api.post(`/api/chat/sessions/${debugSessionId}/cancel`, {
+            tenant_id: TENANT_ID,
+            turn_id: debugTurnId,
+          }).catch(() => undefined);
+        }
+        controller.abort();
+      }, GENERAL_SKILL_RUN_IDLE_TIMEOUT_MS);
+    };
+    resetIdleTimeout();
     try {
       let completed = false;
       await streamPost(
@@ -2254,8 +2272,14 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
           max_attempts: 10,
         },
         (item) => {
+          resetIdleTimeout();
+          if (item.event === 'stream_started') {
+            debugSessionId = typeof item.data.session_id === 'string' ? item.data.session_id : '';
+            debugTurnId = typeof item.data.client_turn_id === 'string' ? item.data.client_turn_id : '';
+          }
           if (item.event === 'trace') {
             const traceItem = item.data;
+            receivedTrace.push(traceItem);
             setLiveResult((current) => {
               const previous = current || { skill_slug: slug, execution_trace: [] };
               const executionTrace = [...(previous.execution_trace || []), traceItem];
@@ -2284,7 +2308,12 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
           if (item.event === 'complete') {
             const result = item.data as unknown as GeneralSkillRunResponse;
             completed = true;
-            setRunResult(result);
+            setRunResult({
+              ...result,
+              execution_trace: result.execution_trace?.length
+                ? result.execution_trace
+                : receivedTrace,
+            });
             setLiveResult(null);
             notify.success('运行完成');
           }
@@ -2307,7 +2336,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       }
     } catch (error) {
       const text = timedOut
-        ? '技能运行超时，请检查模型或稍后重试。'
+        ? '技能测试 10 分钟内未收到新的执行事件，请检查模型或稍后重试。'
         : error instanceof Error ? error.message : '运行失败';
       setLiveResult((current) => ({
         ...(current || { skill_slug: slug, execution_trace: [] }),

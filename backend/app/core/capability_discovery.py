@@ -23,6 +23,7 @@ ALWAYS_EXPANDED_CAPABILITIES = {
     "capability_describe",
     "exec_command",
     "read_file",
+    "extract_document_text",
     "write_file",
     "edit_file",
     "publish_artifact",
@@ -127,7 +128,7 @@ def model_descriptor(descriptor: CapabilityDescriptor) -> CapabilityDescriptor:
         metadata["authorized_knowledge_base_count"] = len(allowed)
     elif descriptor.kind == "general_skill":
         metadata["execution_policy"] = descriptor.metadata.get(
-            "execution_policy", "inspect_then_decide"
+            "execution_policy", "instructions_only"
         )
     elif descriptor.kind == "tool":
         for key in ("tool_type", "method"):

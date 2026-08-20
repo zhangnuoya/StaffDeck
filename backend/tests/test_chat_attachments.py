@@ -3,6 +3,7 @@ import base64
 import pytest
 
 from app.api.chat import _user_message_metadata
+from app.channels.media import normalize_image_media
 from app.session.attachments import (
     image_payloads_from_attachments,
     message_content_with_attachment_context,
@@ -45,7 +46,8 @@ def test_user_message_metadata_keeps_attachments() -> None:
 
 
 def test_image_attachment_uses_supported_extension_and_builds_image_payload() -> None:
-    attachment = parse_chat_attachment("screen.PNG", "application/octet-stream", b"image-bytes")
+    image = b"\x89PNG\r\n\x1a\nimage-bytes"
+    attachment = parse_chat_attachment("screen.PNG", "application/octet-stream", image)
 
     assert attachment.kind == "image"
     assert attachment.content_type == "image/png"
@@ -61,6 +63,21 @@ def test_image_attachment_uses_supported_extension_and_builds_image_payload() ->
     ]
 
 
+def test_historical_image_payload_rejects_invalid_image_signature() -> None:
+    attachment = parse_chat_attachment("screen.jpg", "image/jpeg", b"encrypted-bytes")
+
+    assert attachment.kind == "image"
+    assert image_payloads_from_attachments([attachment]) == []
+
+
+def test_jpeg_with_trailing_channel_bytes_is_normalized() -> None:
+    jpeg = b"\xff\xd8\xffjpeg-data\xff\xd9"
+
+    normalized = normalize_image_media(jpeg + b"\x00channel-trailer")
+
+    assert normalized == (jpeg, "image/jpeg", ".jpg")
+
+
 def test_message_context_uses_sandbox_path_without_inlining_text() -> None:
     attachment = parse_chat_attachment("readme.md", "text/markdown", b"# Title\ncontent")
     attachment = attachment.model_copy(update={"sandbox_path": "/workspace/attachments/readme.md"})
@@ -71,8 +88,32 @@ def test_message_context_uses_sandbox_path_without_inlining_text() -> None:
 
     assert "总结一下" in context
     assert "上传附件上下文" in context
+    assert "exec_command 相对路径：attachments/readme.md" in context
+    assert "typed 文件工具路径：/workspace/attachments/readme.md" in context
     assert "/workspace/attachments/readme.md" in context
     assert "# Title" not in context
+
+
+def test_document_attachment_context_routes_binary_to_extractor() -> None:
+    attachment = ChatAttachmentRead(
+        id="contract-docx",
+        filename="contract.docx",
+        content_type=(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ),
+        size=128,
+        kind="binary",
+        sandbox_path="/workspace/attachments/contract.docx",
+    )
+
+    context = message_content_with_attachment_context(
+        "检查合同",
+        {"attachments": [attachment.model_dump(mode="json")]},
+    )
+
+    assert "exec_command 相对路径：attachments/contract.docx" in context
+    assert "先调用 extract_document_text" in context
+    assert "不要直接使用 read_file" in context
 
 
 def test_path_only_attachment_skips_text_extraction() -> None:

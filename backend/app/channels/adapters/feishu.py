@@ -9,12 +9,20 @@ from typing import Any, Callable
 import httpx
 
 from app.channels.adapters.base import (
+    CHANNEL_TEXT_LIMIT,
     ChannelInboundAttachment,
     register_channel_adapter,
     split_channel_text,
     stream_download_with_limit,
 )
 from app.channels.crypto import decrypt_channel_secret
+from app.channels.markdown_render import (
+    has_markdown,
+    parse_markdown,
+    render_feishu_post,
+    split_markdown_by_lines,
+)
+from app.config import get_settings
 from app.db.models import ChannelBinding
 
 FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
@@ -202,6 +210,8 @@ class FeishuAdapter:
                         response = client.post(url, json=body, **request_kwargs)
                     elif method == "GET":
                         response = client.get(url, **request_kwargs)
+                    elif method == "PATCH":
+                        response = client.patch(url, json=body, **request_kwargs)
                     else:
                         response = client.delete(url, **request_kwargs)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -387,6 +397,136 @@ class FeishuAdapter:
             return response.content
         raise FeishuPermanentError("飞书 token 刷新后仍无法下载附件")
 
+    def create_card(
+        self,
+        binding: ChannelBinding,
+        target: dict[str, Any],
+        card_json: dict[str, Any],
+        *,
+        idempotency_key: str,
+    ) -> str:
+        """发送一张交互式卡片，返回 message_id。
+
+        复用 send() 的目标解析逻辑：有 message_id 走 reply，否则按 receive_id 投递。
+        idempotency_key 生成稳定 uuid，保证重试不重复发卡。
+        """
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise FeishuPermanentError("飞书卡片创建缺少幂等键")
+        message_id = str(target.get("message_id") or "").strip()
+        receive_id = str(target.get("receive_id") or "").strip()
+        receive_id_type = str(target.get("receive_id_type") or "").strip()
+        if not message_id and (not receive_id or not receive_id_type):
+            raise FeishuPermanentError("飞书卡片投递目标无效")
+        body: dict[str, Any] = {
+            "msg_type": "interactive",
+            "content": json.dumps(card_json, ensure_ascii=False),
+            "uuid": self._uuid(key, 0),
+        }
+        if message_id:
+            body["reply_in_thread"] = bool(target.get("reply_in_thread"))
+            data = self._post(
+                binding,
+                f"{FEISHU_API_BASE}/im/v1/messages/{message_id}/reply",
+                params=None,
+                body=body,
+            )
+        else:
+            body["receive_id"] = receive_id
+            data = self._post(
+                binding,
+                f"{FEISHU_API_BASE}/im/v1/messages",
+                params={"receive_id_type": receive_id_type},
+                body=body,
+            )
+        created_id = str((data.get("data") or {}).get("message_id") or "").strip()
+        if not created_id:
+            raise FeishuTransientError("飞书卡片创建响应缺少 message_id")
+        return created_id
+
+    def update_card(
+        self,
+        binding: ChannelBinding,
+        message_id: str,
+        card_json: dict[str, Any],
+    ) -> None:
+        """PATCH 更新已发送卡片的 content。"""
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            raise FeishuPermanentError("飞书卡片更新缺少 message_id")
+        self._request(
+            binding,
+            "PATCH",
+            f"{FEISHU_API_BASE}/im/v1/messages/{message_id}",
+            params=None,
+            body={"content": json.dumps(card_json, ensure_ascii=False)},
+        )
+
+    def resolve_open_id_by_mobile_or_email(
+        self,
+        binding: ChannelBinding,
+        *,
+        mobile: str | None = None,
+        email: str | None = None,
+    ) -> str | None:
+        """飞书通讯录反查 open_id(方案 B):POST /contactv3/users/batch_get_id。
+
+        需要应用具备 contact:user.id:readonly 或 contact:user.base:readonly 权限。
+        传入手机号或邮箱,返回首个命中用户的 open_id;未命中或无权限返回 None。
+        """
+        mobiles = [str(mobile).strip()] if mobile and str(mobile).strip() else []
+        emails = [str(email).strip()] if email and str(email).strip() else []
+        if not mobiles and not emails:
+            return None
+        body: dict[str, Any] = {}
+        if mobiles:
+            body["mobiles"] = mobiles
+        if emails:
+            body["emails"] = emails
+        try:
+            data = self._request(
+                binding,
+                "POST",
+                f"{FEISHU_API_BASE}/contact/v3/users/batch_get_id",
+                params={"user_id_type": "open_id"},
+                body=body,
+            )
+        except Exception:
+            return None
+        user_list = (data.get("data") or {}).get("user_list") or []
+        for item in user_list:
+            open_id = str(item.get("user_id") or "").strip()
+            if open_id:
+                return open_id
+        return None
+
+    def get_user_name(
+        self,
+        binding: ChannelBinding,
+        open_id: str,
+    ) -> str | None:
+        """通过 open_id 查询飞书用户真实姓名: GET /contact/v3/users/{open_id}。
+
+        需要应用具备 contact:user.base:readonly 权限。
+        返回 name 字段;无权限或未命中返回 None。
+        """
+        open_id = str(open_id or "").strip()
+        if not open_id or open_id.startswith("group:"):
+            return None
+        try:
+            data = self._request(
+                binding,
+                "GET",
+                f"{FEISHU_API_BASE}/contact/v3/users/{open_id}",
+                params={"user_id_type": "open_id"},
+                body=None,
+            )
+        except Exception:
+            return None
+        user = (data.get("data") or {}).get("user") or {}
+        name = str(user.get("name") or "").strip()
+        return name or None
+
     def send(
         self,
         binding: ChannelBinding,
@@ -394,7 +534,7 @@ class FeishuAdapter:
         text: str,
         *,
         idempotency_key: str | None = None,
-    ) -> None:
+    ) -> str | None:
         key = str(idempotency_key or "").strip()
         if not str(text or "").strip():
             raise FeishuPermanentError("飞书投递文本不能为空")
@@ -405,15 +545,34 @@ class FeishuAdapter:
         receive_id_type = str(target.get("receive_id_type") or "").strip()
         if not message_id and (not receive_id or not receive_id_type):
             raise FeishuPermanentError("飞书投递目标无效")
-        for index, chunk in enumerate(split_channel_text(text)):
-            body: dict[str, Any] = {
-                "msg_type": "text",
-                "content": json.dumps({"text": chunk}, ensure_ascii=False),
-                "uuid": self._uuid(key, index),
-            }
+        rich_enabled = bool(get_settings().channel_rich_render_enabled)
+        use_rich = rich_enabled and has_markdown(text)
+        if use_rich:
+            chunks = split_markdown_by_lines(text, CHANNEL_TEXT_LIMIT)
+            if not chunks:
+                chunks = [text]
+        else:
+            chunks = split_channel_text(text)
+        # 透传 _post 返回的飞书 message_id,供 outbox 回写 handoff.notify_message_id
+        # (阶段 4 关联回复)。多 chunk 时取最后一条(即完整消息的末段)的 message_id。
+        created_message_id: str | None = None
+        for index, chunk in enumerate(chunks):
+            if use_rich:
+                post_content = render_feishu_post(parse_markdown(chunk))
+                body: dict[str, Any] = {
+                    "msg_type": "post",
+                    "content": json.dumps(post_content, ensure_ascii=False),
+                    "uuid": self._uuid(key, index),
+                }
+            else:
+                body = {
+                    "msg_type": "text",
+                    "content": json.dumps({"text": chunk}, ensure_ascii=False),
+                    "uuid": self._uuid(key, index),
+                }
             if message_id:
                 body["reply_in_thread"] = bool(target.get("reply_in_thread"))
-                self._post(
+                data = self._post(
                     binding,
                     f"{FEISHU_API_BASE}/im/v1/messages/{message_id}/reply",
                     params=None,
@@ -421,12 +580,14 @@ class FeishuAdapter:
                 )
             else:
                 body["receive_id"] = receive_id
-                self._post(
+                data = self._post(
                     binding,
                     f"{FEISHU_API_BASE}/im/v1/messages",
                     params={"receive_id_type": receive_id_type},
                     body=body,
                 )
+            created_message_id = str((data.get("data") or {}).get("message_id") or "").strip() or None
+        return created_message_id
 
     def start_ingress(self, binding_id: str) -> None:
         from app.channels import get_feishu_process_manager

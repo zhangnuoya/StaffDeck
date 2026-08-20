@@ -9,7 +9,8 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
-from app.api.chat import _build_turn_traces, message_read, session_read
+from app.api.chat import _build_turn_traces, session_read
+from app.session.message_read import message_read
 from app.core.harness_session_cleanup import stage_harness_session_execution_reset
 from app.db import get_session
 from app.db.models import (
@@ -28,6 +29,7 @@ from app.observability.session_timings import enrich_turn_traces_with_timings
 from app.security.auth import get_current_user
 from app.security.permissions import agent_owned_by_user, is_admin_user
 from app.security.tenant import ensure_tenant
+from app.session.message_visibility import visible_message_content, visible_message_rows
 
 router = APIRouter(prefix="/api/enterprise/sessions", tags=["enterprise:sessions"])
 
@@ -158,7 +160,10 @@ def _session_details_payload(
     skills = db.exec(select(Skill).where(Skill.tenant_id == tenant_id)).all()
     skill_names = {skill.skill_id: skill.name for skill in skills}
     session_payload_by_id = {str(payload["id"]): payload for payload in _session_payloads(db, rows)}
-    messages_by_session = _group_by_session_id(messages)
+    messages_by_session = {
+        session_id: visible_message_rows(session_messages)
+        for session_id, session_messages in _group_by_session_id(messages).items()
+    }
     events_by_session = _group_by_session_id(events)
     feedback_by_session = _group_by_session_id(feedback_rows)
     invocations_by_session = _group_by_session_id(invocation_rows)
@@ -273,6 +278,7 @@ def _message_payload(
         message,
         feedback.rating if feedback else None,
         db=db,
+        content_override=visible_message_content(message),
     ).model_dump()
     if feedback:
         payload["feedback_id"] = feedback.id

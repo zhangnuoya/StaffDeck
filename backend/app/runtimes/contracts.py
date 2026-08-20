@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from enum import StrEnum
 from typing import Any, Protocol
 
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
+
+EventSink = Callable[[str, dict[str, Any]], None]
 
 
 class AgentRuntimeKind(StrEnum):
@@ -43,6 +45,8 @@ class AgentRuntime(Protocol):
 
     runtime_kind: AgentRuntimeKind
 
-    def handle_turn(self, request: ChatTurnRequest) -> ChatTurnResponse: ...
+    def handle_turn(
+        self, request: ChatTurnRequest, *, event_sink: EventSink | None = None
+    ) -> ChatTurnResponse: ...
 
     def handle_turn_stream(self, request: ChatTurnRequest) -> Iterator[dict[str, Any]]: ...

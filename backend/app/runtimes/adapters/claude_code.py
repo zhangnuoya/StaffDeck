@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,7 +80,10 @@ class ClaudeCodeAgentRuntime:
     # public surface
     # ------------------------------------------------------------------
 
-    def handle_turn(self, request: ChatTurnRequest) -> ChatTurnResponse:
+    def handle_turn(
+        self, request: ChatTurnRequest, *, event_sink: Callable[[str, dict[str, Any]], None] | None = None
+    ) -> ChatTurnResponse:
+        # event_sink 是原生引擎的流式回调;CLI 运行时经自有转录通道落 AgentEvent,忽略该参数。
         prepared = self._prepare_turn(request)
         for _ in self._drive(prepared, streaming=False):
             pass
