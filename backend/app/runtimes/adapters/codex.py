@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from fastapi import HTTPException
@@ -23,6 +23,13 @@ from app.core.agent_identity_prompt import AgentIdentityPrompt
 from app.core.cancellation import clear_chat_turn_cancelled, is_chat_turn_cancelled
 from app.core.conversation_projection import ConversationProjection
 from app.db.models import AgentProfile, ChatSession, Message, utc_now
+from app.harness import HarnessArtifactAccessError, normalize_harness_artifact_path
+from app.harness.artifacts import (
+    HarnessWorkspaceSnapshot,
+    is_noise_artifact_path,
+    publish_harness_artifacts,
+    snapshot_harness_workspace,
+)
 from app.knowledge.citations import (
     compact_knowledge_citation_labels,
     knowledge_citations_from_results,
@@ -74,6 +81,68 @@ class _PreparedTurn:
     # （MCP structuredContent，与原生引擎 response_items 同构），
     # _finalize 时据此生成回复引用的 knowledge_citations。
     knowledge_results: list[dict[str, Any]] = field(default_factory=list)
+    # 产物下载适配：turn 开始时的工作区快照 + codex file_change 事件
+    # 报告的文件路径，_finalize 时并集登记为 harness_artifacts。
+    workspace_before: HarnessWorkspaceSnapshot | None = None
+    changed_paths: list[str] = field(default_factory=list)
+
+
+def _collect_turn_artifacts(
+    workspace: Path,
+    workspace_before: HarnessWorkspaceSnapshot | None,
+    changed_paths: list[str],
+    turn_no: int,
+) -> list[dict[str, Any]]:
+    """把本回合 codex 产物登记为与原生引擎同构的 harness_artifacts 元数据。
+
+    信号并集:file_change 事件(codex 自己改的文件,精确)+ 工作区前后
+    快照 diff(兜底捕获 shell 重定向/脚本写出的文件);排噪后仅保留
+    仍存在的常规文件,sha256/size 与原生同一登记函数保证同构。
+    """
+
+    candidates: list[str] = []
+
+    def add(raw: str) -> None:
+        try:
+            path = normalize_harness_artifact_path(raw)
+        except HarnessArtifactAccessError:
+            return
+        if path and path not in candidates and not is_noise_artifact_path(path):
+            candidates.append(path)
+
+    for raw in changed_paths:
+        add(raw)
+    if workspace_before is not None:
+        try:
+            after = snapshot_harness_workspace(workspace)
+        except OSError:
+            after = None
+        if after is not None:
+            for raw in after:
+                if workspace_before.get(raw) != after[raw]:
+                    add(raw)
+    declarations: list[dict[str, str]] = []
+    for path in candidates:
+        try:
+            if (workspace / path).is_file():
+                declarations.append({"path": path})
+        except OSError:
+            continue
+    if not declarations:
+        return []
+    try:
+        published = publish_harness_artifacts(
+            workspace,
+            f"codex-turn-{turn_no}",
+            declarations,
+            operation="codex_turn",
+        )
+    except (HarnessArtifactAccessError, OSError):
+        return []
+    for entry in published:
+        entry.setdefault("display_name", PurePath(str(entry.get("path"))).name)
+        entry["source"] = "codex"
+    return published
 
 
 class CodexAgentRuntime:
@@ -143,6 +212,10 @@ class CodexAgentRuntime:
         runtime_config = dict(agent.runtime_config_json or {}) if agent else {}
         runtime_state = dict(chat_session.runtime_state_json or {})
         workspace = self._ensure_workspace(chat_session.id)
+        try:
+            workspace_before = snapshot_harness_workspace(workspace)
+        except OSError:
+            workspace_before = None
         is_resume = bool(runtime_state.get("thread_id"))
         prompt = self._build_prompt(request, chat_session, agent, user_message.id, is_resume)
         self._db.commit()
@@ -158,6 +231,7 @@ class CodexAgentRuntime:
             workspace=workspace,
             prompt=prompt,
             is_resume=is_resume,
+            workspace_before=workspace_before,
         )
 
     def _ensure_workspace(self, session_id: str) -> Path:
@@ -467,6 +541,8 @@ class CodexAgentRuntime:
                         # 失败调用（JSON-RPC 级错误）网关不落审计事件，仍需转录兜底展示。
                         if str(item.get("server") or "") == "staffdeck" and not item.get("error"):
                             continue
+                    if item_type == "file_change":
+                        self._collect_changed_paths(prepared, item)
                     yield self._event(
                         prepared,
                         "tool_result",
@@ -528,6 +604,22 @@ class CodexAgentRuntime:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _collect_changed_paths(prepared: _PreparedTurn, item: dict[str, Any]) -> None:
+        """记录 codex file_change 事件报告的本回合改动文件（供产物登记）。"""
+        changes = item.get("changes") if isinstance(item.get("changes"), list) else []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            raw_path = str(change.get("path") or "").strip()
+            if not raw_path:
+                continue
+            kind = str(change.get("kind") or change.get("type") or "").lower()
+            if kind in {"delete", "removed"}:
+                continue
+            if raw_path not in prepared.changed_paths:
+                prepared.changed_paths.append(raw_path)
+
+    @staticmethod
     def _collect_knowledge_item(prepared: _PreparedTurn, item: dict[str, Any]) -> None:
         """提取 staffdeck.query_knowledge 调用的结构化证据包供回复引用。"""
         if str(item.get("server") or "") != "staffdeck":
@@ -566,6 +658,17 @@ class CodexAgentRuntime:
                 )
                 prepared.reply = compacted_reply
                 extra_metadata["knowledge_citations"] = compacted
+        # 产物下载适配:与原生引擎同构的 harness_artifacts 元数据,
+        # 前端消息卡片与下载端点无需感知运行时差异。
+        if not cancelled:
+            artifacts = _collect_turn_artifacts(
+                prepared.workspace,
+                prepared.workspace_before,
+                prepared.changed_paths,
+                int(state.get("turn_count") or 0),
+            )
+            if artifacts:
+                extra_metadata["harness_artifacts"] = artifacts
         bookkeeping.finalize_simple_turn(
             self._db,
             self._events,

@@ -4,11 +4,13 @@ import json
 import logging
 import mimetypes
 import re
+import shutil
 import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
 from datetime import timedelta
+from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -18,8 +20,10 @@ from sqlalchemy import and_, or_, update
 from sqlmodel import Session, select
 from starlette.background import BackgroundTask
 
+from app import paths
 from app.agents.branching import model_for_agent, visible_published_skills
 from app.channels.service_outbox import stage_channel_delivery
+from app.config import get_settings
 from app.core.cancellation import cancel_chat_turn, is_chat_turn_cancelled
 from app.core.capability_manifest import CapabilityManifestBuilder
 from app.core.harness_session_cleanup import (
@@ -2153,6 +2157,8 @@ def delete_chat_session(
             session_id,
             exc_info=True,
         )
+    # CLI 运行时(codex/claude)的工作区与 harness 路径独立,一并清理。
+    _remove_runtime_workspace(row)
     return {"status": "deleted"}
 
 
@@ -2207,7 +2213,7 @@ def download_harness_artifact(
     """Download a file explicitly published by a Harness TaskFrame."""
 
     _ensure_request_tenant(tenant_id, current_user)
-    _get_readable_chat_session(db, tenant_id, current_user, session_id)
+    chat_session = _get_readable_chat_session(db, tenant_id, current_user, session_id)
     frame = db.exec(
         select(HarnessTaskFrameRecord).where(
             HarnessTaskFrameRecord.tenant_id == tenant_id,
@@ -2215,8 +2221,18 @@ def download_harness_artifact(
             HarnessTaskFrameRecord.task_id == task_frame_id,
         )
     ).first()
-    if frame is None:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    if frame is not None:
+        workspace = harness_task_workspace_path(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            task_frame_id=task_frame_id,
+            db=db,
+        )
+    else:
+        # codex/claude 等 CLI 运行时没有 Harness TaskFrame,产物登记在
+        # 消息 metadata(task_frame_id 为合成 turn 标识),文件位于会话
+        # runtime_state_json 记录的工作区(见 adapters/codex.py)。
+        workspace = _runtime_workspace_path(chat_session)
     artifact = _published_workspace_artifact(
         db,
         tenant_id=tenant_id,
@@ -2224,20 +2240,12 @@ def download_harness_artifact(
         task_frame_id=task_frame_id,
         requested_path=path,
     )
-    if artifact is None:
+    if artifact is None or workspace is None:
         raise HTTPException(status_code=404, detail="Artifact not found")
 
     opened = None
     try:
-        opened = open_harness_artifact(
-            harness_task_workspace_path(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                task_frame_id=task_frame_id,
-                db=db,
-            ),
-            path,
-        )
+        opened = open_harness_artifact(workspace, path)
         digest = opened.sha256()
         expected_digest = str(artifact.get("sha256") or "").strip().lower()
         expected_size = artifact.get("size")
@@ -2567,6 +2575,45 @@ def _get_readable_chat_session(db: Session, tenant_id: str, current_user: User, 
     if _user_can_read_handoff_session(db, tenant_id, current_user, session_id):
         return row
     raise HTTPException(status_code=404, detail="Session not found")
+
+
+def _runtime_workspace_path(chat_session: ChatSession) -> Path | None:
+    """CLI 运行时(codex/claude)的会话工作区路径,带白名单校验。
+
+    适配器把工作区绝对路径写入 runtime_state_json;此值虽是服务端写入,
+    仍要求路径位于配置的工作区根之下才接受,防止任意路径读取。
+    """
+
+    state = chat_session.runtime_state_json or {}
+    raw = str(state.get("workspace") or "").strip()
+    if not raw:
+        return None
+    try:
+        workspace = Path(raw).resolve(strict=True)
+    except OSError:
+        return None
+    allowed_roots: list[Path] = []
+    configured_root = (get_settings().codex_workspace_root or "").strip()
+    if configured_root:
+        allowed_roots.append(Path(configured_root))
+    allowed_roots.append(paths.user_data_dir() / "workspaces")
+    for root in allowed_roots:
+        try:
+            root_resolved = root.resolve(strict=False)
+            workspace.relative_to(root_resolved)
+            return workspace
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _remove_runtime_workspace(chat_session: ChatSession) -> None:
+    """会话删除时清理 CLI 运行时工作区(仅在白名单根内,防误删任意目录)。"""
+
+    workspace = _runtime_workspace_path(chat_session)
+    if workspace is None:
+        return
+    shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _published_workspace_artifact(
