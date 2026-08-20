@@ -86,13 +86,15 @@ def test_tool_config_namespaces_execution_and_preserves_existing_policy() -> Non
 
 
 def test_tool_config_rejects_untyped_execution_and_reads_invalid_legacy_safely() -> None:
+    # 9999 超出 timeout_seconds 上限(3600),作为"非法 legacy execution"样本;
+    # 上限随上游 v0.4.2 从 300 提到 3600,旧样本值 999 已变为合法。
     config = _tool_config(
-        {"tool": "sum", "execution": {"timeout_seconds": 999}},
+        {"tool": "sum", "execution": {"timeout_seconds": 9999}},
         None,
     )
 
     assert config == {"tool": "sum"}
-    assert _read_execution_policy({"execution": {"timeout_seconds": 999}}) is None
+    assert _read_execution_policy({"execution": {"timeout_seconds": 9999}}) is None
 
 
 def test_delete_tool_is_tenant_scoped() -> None:

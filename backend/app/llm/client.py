@@ -109,6 +109,10 @@ class _CurrentStageText(str):
 
 
 class LLMClient:
+    # 诊断路径引用的 __init__ 属性需要类级默认:测试常以 object.__new__
+    # 绕过 __init__ 构造伪客户端,部分构造对象上不能抛 AttributeError。
+    model_config_name: str = ""
+
     def __init__(self, model_config: ModelConfig):
         try:
             protocol = ModelApiProtocol(
