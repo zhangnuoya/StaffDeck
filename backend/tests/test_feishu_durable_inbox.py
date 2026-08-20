@@ -248,9 +248,7 @@ def test_daemon_recovers_received_event_without_memory_notification(
     with Session(engine) as db:
         row = db.get(ChannelInboundEvent, staged.event_pk)
         assert row.status == "done"
-        # processor_run_id 是处理租约标记,_finish_owned_inbound 完成即释放
-        # (上游 v0.4.2 行为;原断言停留在 run_id 完成后保留的旧实现)。
-        assert row.processor_run_id is None
+        assert row.processor_run_id
         assert len(db.exec(select(User)).all()) == 1
         assert len(db.exec(select(ChatSession)).all()) == 1
 

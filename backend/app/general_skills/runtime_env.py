@@ -54,10 +54,6 @@ def runtime_environment(
     env["VIRTUAL_ENV"] = str(bin_dir.parent)
     env["GENERAL_SKILL_RUNTIME_PYTHON"] = str(python_path)
     env.setdefault("PYTHONUNBUFFERED", "1")
-    # 父进程以 UTF-8 解码子进程 stdout/stderr,子进程必须强制 UTF-8 输出:
-    # 否则管道走 locale 编码(Windows GBK / 容器 C locale ASCII),非 ASCII 输出即乱码。
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 

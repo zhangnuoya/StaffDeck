@@ -20,7 +20,6 @@ def test_file_tool_registry_exposes_exact_model_tool_names() -> None:
 
     assert registry.names() == (
         "read_file",
-        "extract_document_text",
         "write_file",
         "edit_file",
         "list_directory",
