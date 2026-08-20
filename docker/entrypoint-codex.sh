@@ -12,8 +12,12 @@ set -e
 mkdir -p /home/appuser/.cc-switch /home/appuser/.lark-channel /home/appuser/.codex /home/appuser/workspace
 chown -R appuser:appuser /home/appuser
 # home 目录 751：staffdeck 需穿过 home 到达 workspace（有 x 即可），
-# 但不能列读 appuser 的私有文件（~/.codex 登录态等）
+# 但不能列读 appuser 的私有文件（~/.codex 登录态等）。
+# 组改为 staffwork：产物下载的加固式逐级下钻（open_harness_artifact 从根
+# 目录 O_NOFOLLOW|O_RDONLY 打开每一级）要求途经目录对后端用户可读，
+# 仅 others 的 x 位不够；.codex/.lark-channel 等自身仍 700 appuser，内容不可读。
 chmod 751 /home/appuser 2>/dev/null || true
+chgrp staffwork /home/appuser 2>/dev/null || true
 chgrp -R staffwork /home/appuser/workspace 2>/dev/null || true
 chmod 2770 /home/appuser/workspace 2>/dev/null || true
 # workspace 内所有子目录统一 2770（setgid + 组写）：覆盖旧目录/不同 umask 创建的目录，

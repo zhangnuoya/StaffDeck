@@ -106,8 +106,13 @@ def test_collect_turn_artifacts_unions_signals_and_filters_noise(tmp_path: Path)
     published = _collect_turn_artifacts(
         workspace,
         before,
-        # file_change 信号:包含已存在文件、缺失文件与非法路径,都应被安全处理
-        ["shell-out.txt", "../outside.txt", "missing.txt"],
+        # file_change 信号:codex 报工作区绝对路径;另含缺失文件与越界绝对路径
+        [
+            f"{workspace}/shell-out.txt",
+            "../outside.txt",
+            "/etc/passwd",
+            "missing.txt",
+        ],
         turn_no=3,
     )
 

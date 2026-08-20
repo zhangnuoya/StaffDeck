@@ -110,8 +110,11 @@ def _collect_turn_artifacts(
         if path and path not in candidates and not is_noise_artifact_path(path):
             candidates.append(path)
 
+    # codex file_change 事件报告的是工作区绝对路径,相对化后才能通过
+    # normalize 校验(绝对路径会被产物路径安全策略拒绝)。
+    workspace_prefix = f"{workspace}/"
     for raw in changed_paths:
-        add(raw)
+        add(raw.removeprefix(workspace_prefix))
     if workspace_before is not None:
         try:
             after = snapshot_harness_workspace(workspace)
@@ -137,7 +140,10 @@ def _collect_turn_artifacts(
             declarations,
             operation="codex_turn",
         )
-    except (HarnessArtifactAccessError, OSError):
+    except (HarnessArtifactAccessError, OSError) as exc:
+        logger.warning(
+            "codex 产物登记失败(权限/安全校验未通过) workspace=%s: %s", workspace, exc
+        )
         return []
     for entry in published:
         entry.setdefault("display_name", PurePath(str(entry.get("path"))).name)
