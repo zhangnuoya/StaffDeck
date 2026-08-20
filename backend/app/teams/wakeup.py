@@ -7,8 +7,13 @@ from typing import Literal
 from sqlalchemy import update
 from sqlmodel import Session, select
 
-from app.core import AgentLoop
 from app.db import engine
+from app.runtimes import (
+    AgentRuntimeKind,
+    RuntimeUnavailableError,
+    resolve_runtime_for_request,
+    resolve_runtime_kind,
+)
 from app.db.models import (
     AgentProfile,
     ChatSession,
@@ -563,19 +568,28 @@ def run_agent_turn(
         interaction_mode=interaction_mode,
     )
     result: ChatTurnResponse | None = None
-    for item in AgentLoop(db).handle_turn_stream(request):
+    # 经 runtime bridge 执行:codex/claude 等 CLI 员工与原生员工同样参与团队协作;
+    # 流事件形状与 AgentLoop 同构,消费逻辑不变。
+    try:
+        runtime = resolve_runtime_for_request(db, request)
+    except RuntimeUnavailableError as exc:
+        raise RuntimeError(f"员工运行时不可用,无法执行团队任务:{exc}") from exc
+    for item in runtime.handle_turn_stream(request):
         if item.get("event") in {"complete", "done"} and isinstance(item.get("data"), dict):
             result = ChatTurnResponse.model_validate(item["data"])
     if result is None:
         raise RuntimeError("团队唤醒执行未返回完整结果")
-    outcome = _team_harness_outcome(
-        db,
-        tenant_id=team.tenant_id,
-        session_id=session_id,
-        client_turn_id=turn_id,
-    )
-    if outcome == "needs_input" and not allow_needs_input:
-        raise RuntimeError("agent 需要补充信息才能继续,当前场景不支持挂起等待。")
+    if getattr(runtime, "runtime_kind", None) == AgentRuntimeKind.NATIVE:
+        outcome = _team_harness_outcome(
+            db,
+            tenant_id=team.tenant_id,
+            session_id=session_id,
+            client_turn_id=turn_id,
+        )
+        if outcome == "needs_input" and not allow_needs_input:
+            raise RuntimeError("agent 需要补充信息才能继续,当前场景不支持挂起等待。")
+    # CLI 运行时(codex/claude)没有 Harness v2 持久记录:失败/取消不会产出
+    # complete 事件(上面已拦截),拿到结果即视为完成;needs_input 挂起不适用。
     assistant_message = db.exec(
         select(Message)
         .where(Message.session_id == session_id, Message.role == "assistant")
@@ -716,12 +730,17 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
         allow_needs_input=True,
     ))
     reply = turn_result.reply
-    outcome = _team_harness_outcome(
-        db,
-        tenant_id=team.tenant_id,
-        session_id=session.id,
-        client_turn_id=event.id,
-    )
+    if resolve_runtime_kind(db, team.tenant_id, agent.id, session.id) == AgentRuntimeKind.NATIVE:
+        outcome = _team_harness_outcome(
+            db,
+            tenant_id=team.tenant_id,
+            session_id=session.id,
+            client_turn_id=event.id,
+        )
+    else:
+        # CLI 运行时(codex/claude)无 Harness v2 记录,也没有挂起语义:
+        # run_agent_turn 正常返回即视为完成(run_agent_turn 内已同口径判定)。
+        outcome = "completed"
     task.report_json = {
         "summary": reply[:500],
         "full_reply": reply,

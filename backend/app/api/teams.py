@@ -6,8 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
 
 from app.async_jobs import enqueue_async_job
-from app.core import AgentLoop
 from app.db import get_session
+from app.runtimes import RuntimeUnavailableError, resolve_runtime_for_request
 from app.db.models import (
     AgentEvent,
     AgentProfile,
@@ -408,7 +408,13 @@ def tl_chat_endpoint(
         channel="team",
         interaction_mode="team_tl",
     )
-    response = AgentLoop(db).handle_turn(turn)
+    try:
+        response = resolve_runtime_for_request(db, turn).handle_turn(turn)
+    except RuntimeUnavailableError as exc:
+        # 与 chat.py 会话入口的 409 语义对齐:TL 为 CLI 运行时员工且环境不可用时快速失败。
+        raise HTTPException(
+            status_code=409, detail=f"AGENT_RUNTIME_UNAVAILABLE:{exc.kind}"
+        ) from exc
     reply = response.reply or ""
     created = process_tl_reply(
         db,

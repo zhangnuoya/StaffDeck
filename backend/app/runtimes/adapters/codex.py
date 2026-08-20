@@ -285,6 +285,11 @@ class CodexAgentRuntime:
             "引用来源时使用片段对应的 [n] 编号标注（例如「根据 [1]」）；"
             "证据不足时不得编造企业政策、流程或文档事实，可再次调用 query_knowledge 补充检索。"
         )
+        # 团队/TL 上下文注入(与原生引擎前置到执行消息同语义):花名册、
+        # 未闭环任务、黑板、派任务格式等,仅本轮提示词使用,不落历史。
+        context_injection = (request.context_injection or "").strip()
+        if context_injection:
+            sections.append(context_injection)
         history = self._history_text(chat_session, user_message_id)
         if history:
             sections.append(f"[对话历史]\n{history}")
