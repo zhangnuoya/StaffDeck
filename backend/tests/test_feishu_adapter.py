@@ -297,6 +297,58 @@ def test_empty_text_is_permanent_error() -> None:
         adapter.send(_binding(), {"message_id": "om_source"}, "  ", idempotency_key="d")
 
 
+def test_send_post_sanitizes_local_path_links() -> None:
+    """本地路径链接的 a 节点会被飞书 400 拒绝,必须降级为纯文本。"""
+
+    bodies = []
+
+    def handler(url, kwargs):
+        if "/auth/" in url:
+            return _response(200, {"code": 0, "tenant_access_token": "token", "expire": 7200}, url)
+        bodies.append(kwargs["json"])
+        return _response(200, {"code": 0}, url)
+
+    adapter = FeishuAdapter(client_factory=lambda: FakeClient(handler))
+    adapter.send(
+        _binding(),
+        {"message_id": "om_source"},
+        "报告已生成：[it_service_report.html](/home/appuser/workspace/staffdeck/session_x/it_service_report.html)",
+        idempotency_key="local-link",
+    )
+    assert len(bodies) == 1
+    assert bodies[0]["msg_type"] == "post"
+    content = json.loads(bodies[0]["content"])
+    nodes = [node for paragraph in content["zh_cn"]["content"] for node in paragraph]
+    hrefs = [node.get("href") for node in nodes if node.get("tag") == "a"]
+    assert hrefs == []
+    texts = "".join(str(node.get("text") or "") for node in nodes)
+    # 上游 markdown 解析把文件名内的 _service_ 当斜体强调,下划线被吃掉
+    # (预存行为,不影响消毒语义);这里只断言文件名文字可见。
+    assert "itservicereport.html" in texts
+
+
+def test_send_post_keeps_valid_https_links() -> None:
+    bodies = []
+
+    def handler(url, kwargs):
+        if "/auth/" in url:
+            return _response(200, {"code": 0, "tenant_access_token": "token", "expire": 7200}, url)
+        bodies.append(kwargs["json"])
+        return _response(200, {"code": 0}, url)
+
+    adapter = FeishuAdapter(client_factory=lambda: FakeClient(handler))
+    adapter.send(
+        _binding(),
+        {"message_id": "om_source"},
+        "详情见 [官网](https://example.com/report)。",
+        idempotency_key="valid-link",
+    )
+    content = json.loads(bodies[0]["content"])
+    nodes = [node for paragraph in content["zh_cn"]["content"] for node in paragraph]
+    hrefs = [node.get("href") for node in nodes if node.get("tag") == "a"]
+    assert hrefs == ["https://example.com/report"]
+
+
 @pytest.mark.parametrize(
     "event",
     [

@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -29,6 +30,37 @@ FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 TOKEN_REFRESH_SKEW_SECONDS = 300
 FEISHU_REACTION_TOKEN = "Get"
 _TOKEN_INVALID_CODES = {99991663, 99991664, 99991668}
+
+# 飞书 post 富文本 a 节点要求合法 http(s) URL;本地路径链接(如产物文件
+# 绝对路径)会被 API 以 HTTP 400 拒绝,消毒时降级为纯文本。
+_FEISHU_ALLOWED_LINK_SCHEMES = {"http", "https"}
+
+
+def _is_valid_feishu_href(href: object) -> bool:
+    raw = str(href or "").strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw)
+    return (
+        parsed.scheme in _FEISHU_ALLOWED_LINK_SCHEMES
+        and bool(parsed.netloc)
+    )
+
+
+def _sanitize_feishu_post_links(node: Any) -> Any:
+    """递归把非法 href 的 a 节点降级为 text 节点,其余结构原样保留。"""
+
+    if isinstance(node, dict):
+        if node.get("tag") == "a" and not _is_valid_feishu_href(node.get("href")):
+            return {
+                "tag": "text",
+                "text": str(node.get("text") or ""),
+                "un_escape": False,
+            }
+        return {key: _sanitize_feishu_post_links(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_sanitize_feishu_post_links(item) for item in node]
+    return node
 _PERMANENT_MESSAGE_CODES = {
     230001,  # invalid request/target
     230002,  # bot is not in the chat
@@ -558,7 +590,7 @@ class FeishuAdapter:
         created_message_id: str | None = None
         for index, chunk in enumerate(chunks):
             if use_rich:
-                post_content = render_feishu_post(parse_markdown(chunk))
+                post_content = _sanitize_feishu_post_links(render_feishu_post(parse_markdown(chunk)))
                 body: dict[str, Any] = {
                     "msg_type": "post",
                     "content": json.dumps(post_content, ensure_ascii=False),
