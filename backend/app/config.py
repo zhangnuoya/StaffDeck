@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     wechat_ilink_base_url: str = "https://ilinkai.weixin.qq.com"
     channel_delivery_poll_seconds: float = 1.0
     channel_delivery_max_attempts: int = 8
+    # 渠道产物投递(fork):assistant 回复登记的 harness 产物作为文件消息
+    # 补发到渠道,目前仅飞书 adapter 具备文件能力。
+    channel_artifact_delivery_enabled: bool = True
     public_api_enabled: bool = True
     public_api_key_pepper: str = ""
     public_api_idempotency_ttl_seconds: int = 60 * 60 * 24

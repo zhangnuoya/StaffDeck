@@ -245,6 +245,10 @@ def start_channel_services() -> None:
         get_dingtalk_stream_manager().start()
         start_delivery_daemon()
         start_staged_inbound_daemon()
+        # fork:渠道产物投递守护(飞书文件补发),独立于文本投递管线。
+        from app.channels.artifact_outbound import start_artifact_delivery_daemon
+
+        start_artifact_delivery_daemon()
         # 启动恢复:一次性清扫崩溃残留的 processing 入站事件(独立线程,不阻塞启动)
         _intake_sweep_thread = threading.Thread(
             target=sweep_stale_inbound_events,
@@ -267,6 +271,12 @@ def stop_channel_services(timeout_seconds: float = 5.0) -> bool:
     )
 
     outbox_stopped = stop_delivery_daemon(
+        timeout_seconds=max(0.0, deadline - time.monotonic())
+    )
+    # fork:产物投递守护与文本投递守护独立停机。
+    from app.channels.artifact_outbound import stop_artifact_delivery_daemon
+
+    artifact_stopped = stop_artifact_delivery_daemon(
         timeout_seconds=max(0.0, deadline - time.monotonic())
     )
     poll_manager = _wechat_poll_manager
@@ -292,6 +302,7 @@ def stop_channel_services(timeout_seconds: float = 5.0) -> bool:
     stopped = (
         intake_stopped
         and outbox_stopped
+        and artifact_stopped
         and wechat_stopped
         and wecom_stopped
         and feishu_stopped

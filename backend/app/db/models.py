@@ -1534,3 +1534,34 @@ class TeamTaskBid(SQLModel, table=True):
     score: Optional[float] = None
     score_rationale: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class ChannelArtifactDelivery(SQLModel, table=True):
+    """渠道产物投递(fork 独有):把 assistant 回复登记的 harness 产物
+
+    作为文件消息补发到渠道(目前仅飞书)。独立于 ChannelDelivery 文本
+    投递管线,daemon 扫描 Message 元数据后建行,文本回复失败/延迟
+    不影响本表,反之亦然。
+    """
+
+    __tablename__ = "channel_artifact_deliveries"
+    __table_args__ = (
+        UniqueConstraint("message_id", "artifact_path", name="uq_channel_artifact_message_path"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("chadt"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    binding_id: str = Field(index=True)
+    session_id: str = Field(index=True)
+    message_id: str = Field(index=True)
+    # 产物在工作区内的规范化相对路径(幂等键的一半)
+    artifact_path: str
+    display_name: str = ""
+    # pending/delivered/failed
+    status: str = Field(default="pending", index=True)
+    attempts: int = 0
+    next_attempt_at: Optional[datetime] = Field(default=None, index=True)
+    last_error: Optional[str] = None
+    delivered_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
