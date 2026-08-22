@@ -19,6 +19,10 @@ services:
       - "5174:5173"
     volumes: !override
       - xworker-staffdeck-data:/opt/staffdeck/staffdeck-data
+      # 应用目录整目录 bind mount：宿主 staffdeck/ 直接可见/可改容器代码，
+      # 改代码重启容器即生效。注意：挂载后镜像内代码被遮蔽，重建镜像
+      # 不会更新运行代码——需要回到镜像形态时删除此行并 recreate。
+      - /run/desktop/mnt/host/e/My_Files/Project/StaffDeck/staffdeck:/opt/staffdeck
       - xworker-npx-cache:/home/staffdeck/.npm
       - xworker-uv-cache:/home/staffdeck/.cache/uv
       - xworker-codex-home:/home/appuser/.codex

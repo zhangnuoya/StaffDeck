@@ -52,3 +52,5 @@ pnpm-debug.log*
 packaging/assets/staffdeck.iconset/
 # 容器 codex 工作区数据目录（bind mount 源，运行时数据，不进 git）
 /workspace/
+# 容器 /opt/staffdeck 应用目录的 bind mount 源（镜像内容副本+本地改动，不进 git）
+/staffdeck/
