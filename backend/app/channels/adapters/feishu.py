@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from typing import Any, Callable
@@ -61,6 +62,144 @@ def _sanitize_feishu_post_links(node: Any) -> Any:
     if isinstance(node, list):
         return [_sanitize_feishu_post_links(item) for item in node]
     return node
+
+
+# ---------------------------------------------------------------------------
+# ```echarts 代码块 → 飞书卡片 chart 组件(VChart spec)原生渲染。
+# 飞书图表组件不是 ECharts:VChart 用记录数组(data.values)+字段映射
+# (xField/yField),需要从 ECharts option 的 xAxis.data + series[].data
+# 分离结构转换。仅覆盖常用类型(bar/line/area/pie/scatter),转换不了的
+# option 降级为文字提示,不丢消息。
+# ---------------------------------------------------------------------------
+
+_ECHARTS_BLOCK_RE = re.compile(r"```echarts[^\S\n]*\n(.*?)```", re.DOTALL)
+_MAX_CHART_CARDS_PER_MESSAGE = 5
+_VCHART_SUPPORTED_TYPES = {"bar", "line", "area", "pie", "scatter"}
+
+
+def _echarts_option_title(option: dict[str, Any]) -> str:
+    title = option.get("title")
+    if isinstance(title, str):
+        return title.strip()
+    if isinstance(title, dict):
+        text = title.get("text")
+        if isinstance(text, str):
+            return text.strip()
+    return ""
+
+
+def _extract_echarts_blocks(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """剥离文本中的合法 echarts 代码块;非法块原样保留(照旧当文本发)。"""
+
+    options: list[dict[str, Any]] = []
+
+    def _collect(match: re.Match[str]) -> str:
+        try:
+            parsed = json.loads(match.group(1).strip())
+        except ValueError:
+            return match.group(0)
+        if isinstance(parsed, dict) and isinstance(parsed.get("series"), list):
+            options.append(parsed)
+            return ""
+        return match.group(0)
+
+    stripped = _ECHARTS_BLOCK_RE.sub(_collect, text)
+    return stripped.strip(), options[:_MAX_CHART_CARDS_PER_MESSAGE]
+
+
+def _echarts_series_value(item: Any) -> Any:
+    if isinstance(item, dict):
+        return item.get("value")
+    return item
+
+
+def _echarts_option_to_vchart(option: dict[str, Any]) -> dict[str, Any] | None:
+    series = option.get("series")
+    if not isinstance(series, list) or not series:
+        return None
+    normalized = [s for s in series if isinstance(s, dict)]
+    if len(normalized) != len(series) or not normalized:
+        return None
+    chart_type = str(normalized[0].get("type") or "").lower()
+    if chart_type not in _VCHART_SUPPORTED_TYPES:
+        return None
+    if any(str(s.get("type") or "").lower() != chart_type for s in normalized):
+        return None
+
+    spec: dict[str, Any] = {"type": chart_type}
+    title = _echarts_option_title(option)
+    if title:
+        spec["title"] = {"text": title}
+
+    if chart_type == "pie":
+        values = []
+        for item in normalized[0].get("data") or []:
+            if isinstance(item, dict):
+                values.append(
+                    {
+                        "name": str(item.get("name") or item.get("value") or ""),
+                        "value": _echarts_series_value(item),
+                    }
+                )
+            else:
+                values.append({"name": str(item), "value": item})
+        if not values:
+            return None
+        spec["data"] = {"values": values}
+        spec["categoryField"] = "name"
+        spec["valueField"] = "value"
+        spec["legends"] = {"visible": True}
+        return spec
+
+    if chart_type == "scatter":
+        values = []
+        for s in normalized:
+            for item in s.get("data") or []:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    values.append({"x": item[0], "y": item[1]})
+        if not values:
+            return None
+        spec["data"] = {"values": values}
+        spec["xField"] = "x"
+        spec["yField"] = "y"
+        return spec
+
+    xaxis = option.get("xAxis")
+    if isinstance(xaxis, list) and xaxis:
+        xaxis = xaxis[0] if isinstance(xaxis[0], dict) else None
+    categories = [str(c) for c in (xaxis.get("data") or [])] if isinstance(xaxis, dict) else []
+    if not categories:
+        return None
+
+    multi_series = len(normalized) > 1
+    values: list[dict[str, Any]] = []
+    for s in normalized:
+        name = str(s.get("name") or "系列")
+        data = s.get("data") or []
+        for position, item in enumerate(data):
+            row: dict[str, Any] = {
+                "x": categories[position] if position < len(categories) else str(position),
+                "y": _echarts_series_value(item),
+            }
+            if multi_series:
+                row["series"] = name
+            values.append(row)
+    if not values:
+        return None
+    spec["data"] = {"values": values}
+    spec["xField"] = "x"
+    spec["yField"] = "y"
+    if multi_series:
+        spec["seriesField"] = "series"
+        spec["legends"] = {"visible": True}
+    return spec
+
+
+def _build_feishu_chart_card(spec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "2.0",
+        "body": {"elements": [{"tag": "chart", "chart_spec": spec}]},
+    }
 _PERMANENT_MESSAGE_CODES = {
     230001,  # invalid request/target
     230002,  # bot is not in the chat
@@ -568,10 +707,27 @@ class FeishuAdapter:
         idempotency_key: str | None = None,
     ) -> str | None:
         key = str(idempotency_key or "").strip()
-        if not str(text or "").strip():
-            raise FeishuPermanentError("飞书投递文本不能为空")
         if not key:
             raise FeishuPermanentError("飞书投递缺少幂等键")
+        # echarts 代码块剥离后转飞书卡片 chart 组件;转换失败的块降级为文字行。
+        chart_options: list[dict[str, Any]] = []
+        if get_settings().channel_feishu_chart_cards_enabled:
+            text, chart_options = _extract_echarts_blocks(text)
+        vchart_specs: list[dict[str, Any]] = []
+        fallback_lines: list[str] = []
+        for chart_option in chart_options:
+            spec = _echarts_option_to_vchart(chart_option)
+            if spec is not None:
+                vchart_specs.append(spec)
+            else:
+                fallback_lines.append(
+                    f"📊 图表：{_echarts_option_title(chart_option) or '（未命名）'}"
+                    "（请在网页端查看交互版）"
+                )
+        if fallback_lines:
+            text = "\n\n".join(part for part in (text.strip(), "\n".join(fallback_lines)) if part)
+        if not str(text or "").strip() and not vchart_specs:
+            raise FeishuPermanentError("飞书投递文本不能为空")
         message_id = str(target.get("message_id") or "").strip()
         receive_id = str(target.get("receive_id") or "").strip()
         receive_id_type = str(target.get("receive_id_type") or "").strip()
@@ -579,19 +735,33 @@ class FeishuAdapter:
             raise FeishuPermanentError("飞书投递目标无效")
         rich_enabled = bool(get_settings().channel_rich_render_enabled)
         use_rich = rich_enabled and has_markdown(text)
-        if use_rich:
+        if not str(text or "").strip():
+            chunks = []
+        elif use_rich:
             chunks = split_markdown_by_lines(text, CHANNEL_TEXT_LIMIT)
             if not chunks:
                 chunks = [text]
         else:
             chunks = split_channel_text(text)
+        # 发送单元序列:文字 chunks 在前、图表卡片在后(正文先到图后到)。
+        # 全单元统一编号 uuid,重试时飞书按 uuid 去重,与纯文本 chunk 语义一致。
+        units: list[tuple[str, Any]] = [("text", chunk) for chunk in chunks]
+        units.extend(("card", spec) for spec in vchart_specs)
         # 透传 _post 返回的飞书 message_id,供 outbox 回写 handoff.notify_message_id
         # (阶段 4 关联回复)。多 chunk 时取最后一条(即完整消息的末段)的 message_id。
         created_message_id: str | None = None
-        for index, chunk in enumerate(chunks):
-            if use_rich:
-                post_content = _sanitize_feishu_post_links(render_feishu_post(parse_markdown(chunk)))
+        for index, (unit_kind, payload) in enumerate(units):
+            if unit_kind == "card":
                 body: dict[str, Any] = {
+                    "msg_type": "interactive",
+                    "content": json.dumps(
+                        _build_feishu_chart_card(payload), ensure_ascii=False
+                    ),
+                    "uuid": self._uuid(key, index),
+                }
+            elif use_rich:
+                post_content = _sanitize_feishu_post_links(render_feishu_post(parse_markdown(payload)))
+                body = {
                     "msg_type": "post",
                     "content": json.dumps(post_content, ensure_ascii=False),
                     "uuid": self._uuid(key, index),
@@ -599,7 +769,7 @@ class FeishuAdapter:
             else:
                 body = {
                     "msg_type": "text",
-                    "content": json.dumps({"text": chunk}, ensure_ascii=False),
+                    "content": json.dumps({"text": payload}, ensure_ascii=False),
                     "uuid": self._uuid(key, index),
                 }
             if message_id:

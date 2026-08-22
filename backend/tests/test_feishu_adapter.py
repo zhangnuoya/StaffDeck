@@ -16,6 +16,8 @@ from app.channels.adapters.feishu import (
     FeishuPermanentError,
     FeishuTokenProvider,
     FeishuTransientError,
+    _echarts_option_to_vchart,
+    _extract_echarts_blocks,
     validate_feishu_credentials,
 )
 from app.channels.crypto import encrypt_channel_secret
@@ -347,6 +349,135 @@ def test_send_post_keeps_valid_https_links() -> None:
     nodes = [node for paragraph in content["zh_cn"]["content"] for node in paragraph]
     hrefs = [node.get("href") for node in nodes if node.get("tag") == "a"]
     assert hrefs == ["https://example.com/report"]
+
+
+def _chart_reply_text() -> str:
+    option = json.dumps(
+        {
+            "title": {"text": "月度销售"},
+            "tooltip": {},
+            "legend": {},
+            "xAxis": {"type": "category", "data": ["3月", "4月", "5月"]},
+            "yAxis": {"type": "value"},
+            "series": [
+                {"name": "销售额", "type": "line", "smooth": True, "data": [128, 156, 143]},
+                {"name": "目标", "type": "line", "data": [120, 150, 160]},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    return f"分析结论：整体上升。\n\n```echarts\n{option}\n```"
+
+
+def test_extract_echarts_blocks_splits_text_and_options() -> None:
+    text, options = _extract_echarts_blocks(_chart_reply_text())
+    assert text == "分析结论：整体上升。"
+    assert len(options) == 1
+    assert isinstance(options[0]["series"], list)
+
+    # 非法 JSON 块原样保留。
+    raw = "before\n\n```echarts\n{not json\n```\n\nafter"
+    text, options = _extract_echarts_blocks(raw)
+    assert options == []
+    assert "```echarts" in text and "after" in text
+
+
+def test_echarts_option_to_vchart_translates_common_types() -> None:
+    _, options = _extract_echarts_blocks(_chart_reply_text())
+    spec = _echarts_option_to_vchart(options[0])
+    assert spec is not None
+    assert spec["type"] == "line"
+    assert spec["title"] == {"text": "月度销售"}
+    assert spec["xField"] == "x"
+    assert spec["yField"] == "y"
+    assert spec["seriesField"] == "series"
+    assert spec["data"]["values"] == [
+        {"x": "3月", "y": 128, "series": "销售额"},
+        {"x": "4月", "y": 156, "series": "销售额"},
+        {"x": "5月", "y": 143, "series": "销售额"},
+        {"x": "3月", "y": 120, "series": "目标"},
+        {"x": "4月", "y": 150, "series": "目标"},
+        {"x": "5月", "y": 160, "series": "目标"},
+    ]
+
+    pie = _echarts_option_to_vchart(
+        {
+            "title": {"text": "占比"},
+            "series": [
+                {"type": "pie", "data": [{"name": "A", "value": 3}, {"name": "B", "value": 7}]}
+            ],
+        }
+    )
+    assert pie == {
+        "type": "pie",
+        "title": {"text": "占比"},
+        "data": {"values": [{"name": "A", "value": 3}, {"name": "B", "value": 7}]},
+        "categoryField": "name",
+        "valueField": "value",
+        "legends": {"visible": True},
+    }
+
+    # 不支持的类型/缺类目轴返回 None(触发降级文字)。
+    assert _echarts_option_to_vchart({"series": [{"type": "radar", "data": [1]}]}) is None
+    assert (
+        _echarts_option_to_vchart(
+            {"series": [{"type": "bar", "data": [1, 2]}], "xAxis": {"type": "value"}}
+        )
+        is None
+    )
+
+
+def test_send_emits_text_then_chart_card() -> None:
+    bodies = []
+
+    def handler(url, kwargs):
+        if "/auth/" in url:
+            return _response(200, {"code": 0, "tenant_access_token": "token", "expire": 7200}, url)
+        bodies.append(kwargs["json"])
+        return _response(200, {"code": 0}, url)
+
+    adapter = FeishuAdapter(client_factory=lambda: FakeClient(handler))
+    adapter.send(
+        _binding(),
+        {"message_id": "om_source"},
+        _chart_reply_text(),
+        idempotency_key="chart-reply",
+    )
+    assert [body["msg_type"] for body in bodies] == ["text", "interactive"]
+    text_payload = json.loads(bodies[0]["content"])
+    assert "整体上升" in text_payload["text"]
+    assert "echarts" not in text_payload["text"]
+    card = json.loads(bodies[1]["content"])
+    assert card["schema"] == "2.0"
+    chart_element = card["body"]["elements"][0]
+    assert chart_element["tag"] == "chart"
+    assert chart_element["chart_spec"]["type"] == "line"
+    assert bodies[0]["uuid"] != bodies[1]["uuid"]
+
+
+def test_send_falls_back_to_text_when_chart_unconvertible() -> None:
+    bodies = []
+
+    def handler(url, kwargs):
+        if "/auth/" in url:
+            return _response(200, {"code": 0, "tenant_access_token": "token", "expire": 7200}, url)
+        bodies.append(kwargs["json"])
+        return _response(200, {"code": 0}, url)
+
+    adapter = FeishuAdapter(client_factory=lambda: FakeClient(handler))
+    option = json.dumps(
+        {"title": {"text": "雷达"}, "series": [{"type": "radar", "data": [1, 2]}]}
+    )
+    adapter.send(
+        _binding(),
+        {"message_id": "om_source"},
+        f"结论。\n\n```echarts\n{option}\n```",
+        idempotency_key="chart-fallback",
+    )
+    assert [body["msg_type"] for body in bodies] == ["text"]
+    text_payload = json.loads(bodies[0]["content"])
+    assert "📊 图表：雷达" in text_payload["text"]
+    assert "网页端" in text_payload["text"]
 
 
 @pytest.mark.parametrize(

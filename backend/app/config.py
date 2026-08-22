@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     # 渠道产物投递(fork):assistant 回复登记的 harness 产物作为文件消息
     # 补发到渠道,目前仅飞书 adapter 具备文件能力。
     channel_artifact_delivery_enabled: bool = True
+    # 飞书图表卡片(fork):回复中的 ```echarts 代码块转飞书卡片 chart 组件
+    # 原生渲染;关闭时按普通文本代码块发出。
+    channel_feishu_chart_cards_enabled: bool = True
     public_api_enabled: bool = True
     public_api_key_pepper: str = ""
     public_api_idempotency_ttl_seconds: int = 60 * 60 * 24
