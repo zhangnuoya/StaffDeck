@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 
 import CodeBlock from '@/components/CodeBlock';
 
@@ -51,9 +51,12 @@ type ChartBlockProps = {
  * ```echarts 代码块渲染：内容必须是合法 JSON 的 echarts option（声明式，
  * 无函数/无执行面）。解析失败或运行时异常一律降级为原生 JSON 代码块，
  * 内容不丢失。echarts 走动态 import 懒加载，不进主 chunk。
+ *
+ * 聊天页有轮询/流式重渲染：option 必须 useMemo 稳定引用 + 组件 memo，
+ * 否则每次父级重渲染都会销毁重建 echarts 实例，图表反复闪烁。
  */
-export default function ChartBlock({ code }: ChartBlockProps) {
-  const option = parseEchartsOption(code);
+function ChartBlock({ code }: ChartBlockProps) {
+  const option = useMemo(() => parseEchartsOption(code), [code]);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -96,3 +99,5 @@ export default function ChartBlock({ code }: ChartBlockProps) {
     </div>
   );
 }
+
+export default memo(ChartBlock);
