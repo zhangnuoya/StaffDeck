@@ -74,7 +74,7 @@ def _sanitize_feishu_post_links(node: Any) -> Any:
 
 _ECHARTS_BLOCK_RE = re.compile(r"```echarts[^\S\n]*\n(.*?)```", re.DOTALL)
 _MAX_CHART_CARDS_PER_MESSAGE = 5
-_VCHART_SUPPORTED_TYPES = {"bar", "line", "area", "pie", "scatter"}
+_VCHART_SUPPORTED_TYPES = {"bar", "line", "area", "pie", "scatter", "radar", "funnel", "gauge"}
 
 
 def _echarts_option_title(option: dict[str, Any]) -> str:
@@ -131,7 +131,10 @@ def _echarts_option_to_vchart(option: dict[str, Any]) -> dict[str, Any] | None:
     if title:
         spec["title"] = {"text": title}
 
-    if chart_type == "pie":
+    if chart_type in ("pie", "funnel"):
+        # ECharts 玫瑰图不是独立类型:pie + roseType。VChart 用 type=rose。
+        rose = bool(str(normalized[0].get("roseType") or "").strip())
+        spec["type"] = "rose" if (chart_type == "pie" and rose) else chart_type
         values = []
         for item in normalized[0].get("data") or []:
             if isinstance(item, dict):
@@ -149,6 +152,64 @@ def _echarts_option_to_vchart(option: dict[str, Any]) -> dict[str, Any] | None:
         spec["categoryField"] = "name"
         spec["valueField"] = "value"
         spec["legends"] = {"visible": True}
+        return spec
+
+    if chart_type == "gauge":
+        first_data = normalized[0].get("data") or []
+        gauge_value: Any = None
+        if first_data and isinstance(first_data[0], dict):
+            gauge_value = first_data[0].get("value")
+        elif first_data:
+            gauge_value = first_data[0]
+        if gauge_value is None:
+            return None
+        spec["data"] = {"values": [{"value": gauge_value}]}
+        spec["valueField"] = "value"
+        return spec
+
+    if chart_type == "radar":
+        # ECharts radar:radar.indicator 给维度名,series[].data 是
+        # [{value: [多维数值], name}] 或裸数组;VChart 用记录数组展开。
+        radar = option.get("radar")
+        if isinstance(radar, list) and radar and isinstance(radar[0], dict):
+            radar = radar[0]
+        indicators: list[str] = []
+        if isinstance(radar, dict):
+            for item in radar.get("indicator") or []:
+                if isinstance(item, dict) and str(item.get("name") or "").strip():
+                    indicators.append(str(item["name"]).strip())
+        if not indicators:
+            return None
+        entries: list[tuple[str, list[Any]]] = []
+        for s in normalized:
+            for item in s.get("data") or []:
+                if isinstance(item, dict) and isinstance(item.get("value"), list):
+                    entries.append((str(item.get("name") or "系列"), list(item["value"])))
+                elif isinstance(item, list):
+                    entries.append(("系列", list(item)))
+        if not entries:
+            return None
+        multi_radar = len(entries) > 1
+        values: list[dict[str, Any]] = []
+        for entry_name, entry_values in entries:
+            for position, value in enumerate(entry_values):
+                row: dict[str, Any] = {
+                    "dimension": (
+                        indicators[position]
+                        if position < len(indicators)
+                        else f"维度{position + 1}"
+                    ),
+                    "value": value,
+                }
+                if multi_radar:
+                    row["series"] = entry_name
+                values.append(row)
+        spec["data"] = {"values": values}
+        spec["categoryField"] = "dimension"
+        spec["valueField"] = "value"
+        if multi_radar:
+            spec["seriesField"] = "series"
+            spec["legends"] = {"visible": True}
         return spec
 
     if chart_type == "scatter":

@@ -417,6 +417,74 @@ def test_echarts_option_to_vchart_translates_common_types() -> None:
         "legends": {"visible": True},
     }
 
+    # 玫瑰图:pie + roseType → VChart type=rose。
+    rose = _echarts_option_to_vchart(
+        {
+            "series": [
+                {
+                    "type": "pie",
+                    "roseType": "radius",
+                    "data": [{"name": "A", "value": 3}, {"name": "B", "value": 7}],
+                }
+            ]
+        }
+    )
+    assert rose is not None and rose["type"] == "rose"
+
+    # 漏斗图与 pie 同构(categoryField/valueField)。
+    funnel = _echarts_option_to_vchart(
+        {
+            "series": [
+                {
+                    "type": "funnel",
+                    "data": [{"name": "访问", "value": 100}, {"name": "下单", "value": 40}],
+                }
+            ]
+        }
+    )
+    assert funnel == {
+        "type": "funnel",
+        "data": {"values": [{"name": "访问", "value": 100}, {"name": "下单", "value": 40}]},
+        "categoryField": "name",
+        "valueField": "value",
+        "legends": {"visible": True},
+    }
+
+    # 仪表盘:单值。
+    gauge = _echarts_option_to_vchart(
+        {"series": [{"type": "gauge", "data": [{"value": 72, "name": "完成率"}]}]}
+    )
+    assert gauge == {"type": "gauge", "data": {"values": [{"value": 72}]}, "valueField": "value"}
+
+    # 雷达图:indicator 维度 + 多系列数值数组展开为记录。
+    radar = _echarts_option_to_vchart(
+        {
+            "radar": {"indicator": [{"name": "销售"}, {"name": "研发"}, {"name": "服务"}]},
+            "series": [
+                {"type": "radar", "data": [{"value": [80, 90, 70], "name": "本期"}]},
+                {"type": "radar", "data": [{"value": [75, 85, 65], "name": "上期"}]},
+            ],
+        }
+    )
+    assert radar is not None
+    assert radar["type"] == "radar"
+    assert radar["categoryField"] == "dimension"
+    assert radar["seriesField"] == "series"
+    assert radar["data"]["values"] == [
+        {"dimension": "销售", "value": 80, "series": "本期"},
+        {"dimension": "研发", "value": 90, "series": "本期"},
+        {"dimension": "服务", "value": 70, "series": "本期"},
+        {"dimension": "销售", "value": 75, "series": "上期"},
+        {"dimension": "研发", "value": 85, "series": "上期"},
+        {"dimension": "服务", "value": 65, "series": "上期"},
+    ]
+
+    # 雷达缺 indicator 维度声明 → 降级。
+    assert (
+        _echarts_option_to_vchart({"series": [{"type": "radar", "data": [{"value": [1, 2]}]}]})
+        is None
+    )
+
     # 不支持的类型/缺类目轴返回 None(触发降级文字)。
     assert _echarts_option_to_vchart({"series": [{"type": "radar", "data": [1]}]}) is None
     assert (
