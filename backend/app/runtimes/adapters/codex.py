@@ -769,7 +769,9 @@ class CodexAgentRuntime:
         persist: bool = False,
         streaming: bool = True,
     ) -> dict[str, Any]:
-        if persist and streaming:
+        if persist:
+            # 工具调用等持久事件与流式无关:渠道/定时任务触发的非流式轮次
+            # 同样落 agent_events,网页端回看渠道会话才有"调用工具"卡片。
             self._events.record(prepared.request.tenant_id, prepared.chat_session.id, kind, payload)
             self._db.commit()
         data = {

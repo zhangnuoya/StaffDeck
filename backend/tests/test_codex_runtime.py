@@ -132,6 +132,19 @@ def test_handle_turn_end_to_end_with_fake_cli(codex_settings, tmp_path) -> None:
         assert assistant.metadata_json["codex_thread_id"] == "thread_fake_1"
         assert assistant.metadata_json["codex_usage"]["output_tokens"] == 5
 
+        # 非流式轮次(渠道/定时任务入口)的工具调用同样落 agent_events,
+        # 网页端回看渠道会话才有"调用工具"卡片(回归:persist 不再依赖 streaming)。
+        tool_events = list(
+            db.exec(
+                select(AgentEvent).where(
+                    AgentEvent.session_id == session.id,
+                    AgentEvent.event_type == "tool_result",
+                )
+            ).all()
+        )
+        assert len(tool_events) == 1
+        assert tool_events[0].payload_json["toolId"] == "codex.command"
+
         capture = _read_capture(tmp_path)
         argv_text = " ".join(capture["argv"])
         assert "exec" in capture["argv"]
