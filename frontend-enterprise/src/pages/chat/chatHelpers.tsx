@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 
+import ChartBlock from './components/ChartBlock';
 import CodeBlock from '@/components/CodeBlock';
 import { ApiError } from '@/api/client';
 import type { StreamEvent } from '@/api/client';
@@ -440,9 +441,13 @@ export function renderMarkdownBlocks(
         index += 1;
       }
       if (index < lines.length) index += 1;
-      blocks.push(
-        <CodeBlock key={key} className="md-code-block" code={codeLines.join('\n')} language={language || undefined} />,
-      );
+      if (language === 'echarts') {
+        blocks.push(<ChartBlock key={key} code={codeLines.join('\n')} />);
+      } else {
+        blocks.push(
+          <CodeBlock key={key} className="md-code-block" code={codeLines.join('\n')} language={language || undefined} />,
+        );
+      }
       blockIndex += 1;
       continue;
     }

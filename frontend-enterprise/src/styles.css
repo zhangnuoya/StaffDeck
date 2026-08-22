@@ -2699,6 +2699,28 @@ pre {
   white-space: pre;
 }
 
+/* ```echarts 代码块的交互图表容器（解析失败自动降级为 JSON 代码块） */
+.md-chart-block {
+  box-sizing: border-box;
+  max-width: 100%;
+  margin: 8px 0;
+  padding: 8px;
+  border: 1px solid var(--code-border);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.md-chart-caption {
+  padding: 4px 8px 8px;
+  color: var(--fg, #1f2329);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.md-chart-container {
+  min-width: 0;
+}
+
 .code-block-vscode code {
   display: block;
   padding: 0;

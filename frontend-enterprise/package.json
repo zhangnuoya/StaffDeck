@@ -18,6 +18,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cytoscape": "^3.34.0",
+    "echarts": "^6.1.0",
     "lucide-react": "^1.27.0",
     "pinyin-pro": "^3.28.2",
     "qrcode": "^1.5.4",

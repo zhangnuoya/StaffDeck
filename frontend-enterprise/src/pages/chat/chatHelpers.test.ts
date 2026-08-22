@@ -13,8 +13,11 @@ import {
   knowledgeCitations,
   messageAttachments,
   renderInlineMarkdown,
+  renderMarkdownBlocks,
   scheduledDraftForMessage,
 } from './chatHelpers';
+import ChartBlock from './components/ChartBlock';
+import CodeBlock from '@/components/CodeBlock';
 
 function message(patch: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -88,6 +91,22 @@ describe('chat history consumer contract', () => {
     );
     expect(rendered).toContain('<code>https://internal.test</code>');
     expect(rendered.match(/href=/g)).toHaveLength(2);
+  });
+
+  it('routes echarts code blocks to ChartBlock instead of CodeBlock', () => {
+    const blocks = renderMarkdownBlocks(
+      '结论如下：\n\n```echarts\n{"series": [{"type": "bar", "data": [1, 2]}]}\n```\n\n```json\n{"a": 1}\n```',
+    );
+    const chartElements = blocks.filter(
+      (block) => typeof block === 'object' && block !== null && (block as { type?: unknown }).type === ChartBlock,
+    );
+    expect(chartElements).toHaveLength(1);
+    expect((chartElements[0] as unknown as { props: { code: string } }).props.code).toContain('"series"');
+    // 其它语言的代码块仍走原生 CodeBlock。
+    const codeElements = blocks.filter(
+      (block) => typeof block === 'object' && block !== null && (block as { type?: unknown }).type === CodeBlock,
+    );
+    expect(codeElements).toHaveLength(1);
   });
 
   it('makes www links clickable by adding a safe HTTPS target', () => {
