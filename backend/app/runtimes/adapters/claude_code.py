@@ -27,6 +27,10 @@ from app.db.models import AgentProfile, ChatSession, Message, utc_now
 from app.mcp_gateway import issue_capability_token
 from app.observability.event_log import EventLog
 from app.runtimes import bookkeeping
+from app.runtimes.adapters._attachments import (
+    materialize_turn_attachments,
+    render_attachment_section,
+)
 from app.runtimes.adapters._cli_common import kill_process_tree, parse_jsonl, reply_chunks
 from app.runtimes.contracts import AgentRuntimeKind
 from app.runtimes.memory_bridge import (
@@ -133,9 +137,18 @@ class ClaudeCodeAgentRuntime:
         workspace = self._ensure_workspace(chat_session.id)
         is_resume = bool(runtime_state.get("thread_id"))
         message = request.message
-        attachment_text = _attachment_text(request)
-        if attachment_text:
-            message = f"{message}\n\n{attachment_text}"
+        # 与 codex 适配器同构:附件物化到工作区后以路径注入 prompt,
+        # web 附件(text 恒为 None)由此对 CLI agent 可见。
+        attachment_section = render_attachment_section(
+            materialize_turn_attachments(
+                request.attachments,
+                workspace=workspace,
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+            )
+        )
+        if attachment_section:
+            message = f"{message}\n\n{attachment_section}"
         system_prompt = self._system_prompt(agent)
         memories = recall_memory_context(
             self._db, request.tenant_id, request.user_id, chat_session.agent_id
@@ -627,14 +640,6 @@ def _claude_base_command(settings: Any) -> list[str]:
     if os.name == "nt" and lowered.endswith((".cmd", ".bat")):
         return ["cmd", "/c", raw]
     return [raw]
-
-
-def _attachment_text(request: ChatTurnRequest) -> str:
-    parts: list[str] = []
-    for attachment in request.attachments:
-        if attachment.kind == "text" and attachment.text:
-            parts.append(f"[附件 {attachment.filename}]\n{attachment.text[:4000]}")
-    return "\n\n".join(parts)
 
 
 def _tool_use_activity_payload(block: dict[str, Any]) -> dict[str, Any]:

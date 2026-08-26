@@ -37,6 +37,11 @@ from app.knowledge.citations import (
 from app.mcp_gateway import issue_capability_token
 from app.observability.event_log import EventLog
 from app.runtimes import bookkeeping
+from app.runtimes.adapters._attachments import (
+    materialize_turn_attachments,
+    materialized_image_relative_paths,
+    render_attachment_section,
+)
 from app.runtimes.adapters._cli_common import kill_process_tree, parse_jsonl, reply_chunks
 from app.runtimes.contracts import AgentRuntimeKind
 from app.runtimes.memory_bridge import (
@@ -90,6 +95,9 @@ class _PreparedTurn:
     # 报告的文件路径，_finalize 时并集登记为 harness_artifacts。
     workspace_before: HarnessWorkspaceSnapshot | None = None
     changed_paths: list[str] = field(default_factory=list)
+    # 本轮物化成功的图片附件(工作区相对路径),经 `codex exec -i` 作为
+    # 视觉输入直接提供给模型;依赖 codex CLI/模型支持多模态。
+    image_paths: list[str] = field(default_factory=list)
 
 
 def _collect_turn_artifacts(
@@ -223,6 +231,19 @@ class CodexAgentRuntime:
         runtime_config = dict(agent.runtime_config_json or {}) if agent else {}
         runtime_state = dict(chat_session.runtime_state_json or {})
         workspace = self._ensure_workspace(chat_session.id)
+        # web 附件(text 恒为 None)必须物化到工作区后才对 codex 可见;
+        # 渠道附件带服务端提取文本,同样落盘并保留内联节选。
+        # 图片额外经 codex exec -i 作为视觉输入(codex 0.147+ 支持)。
+        materialized = materialize_turn_attachments(
+            request.attachments,
+            workspace=workspace,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+        )
+        attachment_section = render_attachment_section(
+            materialized, vision_supported=True
+        )
+        image_paths = materialized_image_relative_paths(materialized)
         try:
             workspace_before = snapshot_harness_workspace(workspace)
         except OSError:
@@ -239,7 +260,13 @@ class CodexAgentRuntime:
                 {"memories": memories, "runtime": AgentRuntimeKind.CODEX.value},
             )
         prompt = self._build_prompt(
-            request, chat_session, agent, user_message.id, is_resume, memories
+            request,
+            chat_session,
+            agent,
+            user_message.id,
+            is_resume,
+            memories,
+            attachment_section=attachment_section,
         )
         self._db.commit()
         self._db.refresh(chat_session)
@@ -255,6 +282,7 @@ class CodexAgentRuntime:
             prompt=prompt,
             is_resume=is_resume,
             workspace_before=workspace_before,
+            image_paths=image_paths,
         )
 
     def _ensure_workspace(self, session_id: str) -> Path:
@@ -283,11 +311,12 @@ class CodexAgentRuntime:
         user_message_id: str,
         is_resume: bool,
         memories: list[dict[str, Any]] | None = None,
+        *,
+        attachment_section: str = "",
     ) -> str:
         message = request.message
-        attachment_text = self._attachment_text(request)
-        if attachment_text:
-            message = f"{message}\n\n{attachment_text}"
+        if attachment_section:
+            message = f"{message}\n\n{attachment_section}"
         if is_resume:
             # resume 轮同样注入记忆：codex thread 上下文不会因记忆更新而刷新，
             # 每轮前置最新记忆段保证与库内记忆一致。
@@ -339,14 +368,6 @@ class CodexAgentRuntime:
                 lines.append(f"{speaker}：{content[:500]}")
         return "\n".join(lines[-_HISTORY_MESSAGE_LIMIT:])
 
-    @staticmethod
-    def _attachment_text(request: ChatTurnRequest) -> str:
-        parts: list[str] = []
-        for attachment in request.attachments:
-            if attachment.kind == "text" and attachment.text:
-                parts.append(f"[附件 {attachment.filename}]\n{attachment.text[:4000]}")
-        return "\n\n".join(parts)
-
     # ------------------------------------------------------------------
     # codex invocation
     # ------------------------------------------------------------------
@@ -387,6 +408,10 @@ class CodexAgentRuntime:
         args += ["-", "--json", "--skip-git-repo-check"]
         if not prepared.is_resume:
             args += ["-C", str(prepared.workspace)]
+        # exec 与 exec resume 都接受 -i(codex 0.147 实测);绝对路径与
+        # -C/cwd 无关,resume 轮(不带 -C)也能稳定解析。
+        for relative in prepared.image_paths:
+            args += ["-i", str(prepared.workspace / relative)]
         sandbox = self._resolve_sandbox(prepared)
         if sandbox == "bypass":
             # 显式 bypass（或 Windows 默认）：完全关闭审批与沙箱。

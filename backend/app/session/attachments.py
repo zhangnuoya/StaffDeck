@@ -15,7 +15,6 @@ from app.db.models import new_id
 from app.session.attachment_store import sandbox_attachment_path
 from app.session.session_schema import ChatAttachmentRead
 
-
 MAX_EXTRACTED_TEXT_CHARS = 24_000
 MAX_PREVIEW_CHARS = 600
 IMAGE_DATA_URL_LIMIT_BYTES = 4 * 1024 * 1024
@@ -309,9 +308,13 @@ def _path_only_attachment(
     )
 
 
-def _pdf_attachment(filename: str, content_type: str, data: bytes) -> ChatAttachmentRead:
-    text = ""
-    error: str | None = None
+def extract_pdf_text(data: bytes) -> tuple[str, str | None]:
+    """Extract up to 30 pages of UTF-8 text from a PDF payload.
+
+    Returns ``(text, error)``; ``text`` is empty when extraction fails and
+    ``error`` carries a readable reason. Shared by the upload parser and the
+    CLI-runtime attachment materializer.
+    """
     try:
         from pypdf import PdfReader
 
@@ -322,8 +325,13 @@ def _pdf_attachment(filename: str, content_type: str, data: bytes) -> ChatAttach
         text = "\n\n".join(page.strip() for page in pages if page.strip())
         if len(reader.pages) > 30:
             text += f"\n\n... PDF 共 {len(reader.pages)} 页，仅提取前 30 页。"
+        return text, None
     except Exception as exc:  # noqa: BLE001 - return readable parse error to caller.
-        error = f"PDF 解析失败：{exc}"
+        return "", f"PDF 解析失败：{exc}"
+
+
+def _pdf_attachment(filename: str, content_type: str, data: bytes) -> ChatAttachmentRead:
+    text, error = extract_pdf_text(data)
     trimmed = _trim_text(text, MAX_EXTRACTED_TEXT_CHARS)
     return ChatAttachmentRead(
         id=new_id("file"),
